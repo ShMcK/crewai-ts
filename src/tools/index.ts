@@ -1,57 +1,68 @@
 // Tool definitions for crew-ai-ts
 
 /**
- * Interface for defining a tool that an Agent can use.
- * The `execute` method can take a structured input or a simple string,
- * and should return a string output for the LLM.
+ * Represents a tool that an agent can use.
+ * @template TInput The type of the input parameter for the tool's execute method.
+ * @template TOutput The type of the output/result from the tool's execute method.
  */
-export interface Tool<TInput = unknown, TOutput = string> {
+export interface Tool<TInput = unknown, TOutput = unknown> {
   name: string;
   description: string;
+  // biome-ignore lint/suspicious/noExplicitAny: Flexible input for tools
   execute: (input: TInput) => Promise<TOutput>;
-  // Optional: a method to define input schema for LLMs (e.g., JSON schema)
-  // getInputSchema?: () => object;
+  // Optional: Define if the tool's output can be directly used as input for another task/agent
+  // isOutputSharable?: boolean;
+  // Optional: A schema for the expected input, could be a JSON schema object or a validation function.
+  // inputSchema?: object | ((input: any) => { valid: boolean; message?: string });
 }
 
 /**
- * Abstract base class for creating tools.
- * Simplifies tool creation by requiring implementation of name, description, and _execute.
+ * Higher-order function to create a tool executor with standardized error handling.
+ * This function is not exported but used internally by tools if desired.
+ * @param toolName The name of the tool, used in error messages.
+ * @param coreExecute The core logic function of the tool.
  */
-export abstract class BaseTool<TInput = unknown, TOutput = string> implements Tool<TInput, TOutput> {
-  abstract name: string;
-  abstract description: string;
-
-  // biome-ignore lint/suspicious/noExplicitAny: Input type is generic by design for BaseTool
-  protected abstract _execute(input: TInput): Promise<TOutput>;
-
-  // biome-ignore lint/suspicious/noExplicitAny: Input type is generic for the public execute
-  async execute(input: TInput): Promise<TOutput> {
+function createToolExecutor<TInput, TOutput>(
+  toolName: string,
+  // biome-ignore lint/suspicious/noExplicitAny: coreExecute can have any input/output
+  coreExecute: (input: TInput) => Promise<any>,
+): (input: TInput) => Promise<TOutput | string> { // Output can be TOutput or an error string
+  return async (input: TInput): Promise<TOutput | string> => {
     try {
-      return await this._execute(input);
-    } catch (error) {
-      // Generic error handling for tools
-      console.error(`Error executing tool ${this.name}:`, error);
-      // Return a string representation of the error to the LLM
-      return `Error in tool ${this.name}: ${error instanceof Error ? error.message : String(error)}` as TOutput;
-    }
-  }
-}
-
-// Example of a simple tool implementation (can be moved to a separate file later)
-export class SimpleCalculatorTool extends BaseTool<string, string> {
-  name = "SimpleCalculator";
-  description = "A simple calculator that can perform addition, subtraction, multiplication, and division on two numbers. Input should be a string like '5 + 3' or '10 * 2'.";
-
-  protected async _execute(input: string): Promise<string> {
-    try {
-      // biome-ignore lint: Eval is used for a simple demo, not for production code.
-      const result = eval(input);
-      if (typeof result === 'number' && !Number.isNaN(result)) {
-        return String(result);
-      }
-      return "Invalid calculation expression or result.";
+      const result = await coreExecute(input);
+      return result as TOutput;
     } catch (e) {
-      return `Calculation error: ${e instanceof Error ? e.message : String(e)}`;
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      // console.error(`Error in tool ${toolName}:`, errorMessage);
+      return `Error in tool ${toolName}: ${errorMessage}`;
     }
-  }
+  };
 }
+
+// Example Tool: SimpleCalculatorTool (refactored as a plain object)
+export const simpleCalculatorTool: Tool<string, string> = {
+  name: 'SimpleCalculator',
+  description:
+    'A simple calculator that evaluates mathematical expressions. Input should be a string like "5 + 3" or "10 * 2 / 4".',
+  // biome-ignore lint/security/noGlobalEval: This tool explicitly uses eval for calculations
+  async execute(expression: string): Promise<string> {
+    try {
+      // biome-ignore lint/security/noGlobalEval: Core functionality of this specific tool
+      const result = eval(expression);
+
+      if (result === Number.POSITIVE_INFINITY || result === Number.NEGATIVE_INFINITY || Number.isNaN(result)) {
+        return 'Invalid calculation expression or result.';
+      }
+      return String(result);
+    } catch (e) {
+      // Handle specific errors like SyntaxError from eval
+      if (e instanceof SyntaxError || e instanceof ReferenceError) {
+        return `Calculation error: ${e.message}`;
+      }
+      return 'Invalid calculation expression or result.'; // Generic fallback for other errors
+    }
+  },
+};
+
+// Add more tools here as needed
+// e.g., WebSearchTool, FileReadTool, etc.

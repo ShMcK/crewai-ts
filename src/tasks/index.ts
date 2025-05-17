@@ -1,58 +1,103 @@
 // Task definitions for crew-ai-ts
-import type { Agent } from '../agents';
+import { type Agent, performAgentTask } from '../agents';
+import { v4 as uuidv4 } from 'uuid';
 
+// Task Configuration (Input to create a task)
 export interface TaskConfig {
   description: string;
   expectedOutput: string;
-  agent?: Agent;
-  context?: string; // Data from other tasks, to be stringified or structured
-  asyncExecution?: boolean;
-  // Add other relevant properties from the Python version as we discover them
+  agent?: Agent; // Agent who is preferred/assigned to perform the task
+  context?: string; // Data from other tasks or initial context
+  asyncExecution?: boolean; // Hint for the crew on how to run this
+  // Example of a potential future config property:
+  // toolNames?: string[]; // Specify tools required/allowed for this task
 }
 
-export class Task {
-  description: string;
-  expectedOutput: string;
-  agent?: Agent;
-  context?: string;
-  asyncExecution: boolean;
-  output?: string | object; // Task output
-  private completed = false;
+// Task State (Represents a task instance with its current state)
+export interface Task {
+  readonly id: string; // Unique identifier for the task instance
+  readonly config: TaskConfig; // The original configuration
 
-  constructor(config: TaskConfig) {
-    this.description = config.description;
-    this.expectedOutput = config.expectedOutput;
-    this.agent = config.agent;
-    this.context = config.context;
-    this.asyncExecution = config.asyncExecution ?? false;
+  status: 'pending' | 'in_progress' | 'completed' | 'failed';
+  output?: string | object; // The result of the task execution
+  error?: string; // Error message if the task failed
+  logs: string[]; // For capturing execution logs specific to this task run
+  startedAt?: Date;
+  completedAt?: Date;
+}
+
+// Factory function to create a new task instance
+export function createTask(config: TaskConfig): Task {
+  return {
+    id: uuidv4(),
+    config,
+    status: 'pending',
+    logs: [],
+  };
+}
+
+// Function to execute a task
+// This function mutates the task object with the result and status.
+// It requires an agent to perform the execution.
+export async function executeTask(
+  task: Task,
+  agentForExecution: Agent, // The agent that will execute this task
+): Promise<void> {
+  // Prevent re-execution of already completed or currently non-async in-progress tasks
+  if (task.status === 'completed' || (task.status === 'in_progress' && !task.config.asyncExecution)) {
+    const message = `Task execution skipped: Task '${task.config.description}' (ID: ${task.id}) is already ${task.status}.`;
+    task.logs.push(`[${new Date().toISOString()}] ${message}`);
+    console.warn(message);
+    return;
   }
 
-  isCompleted(): boolean {
-    return this.completed;
-  }
+  task.status = 'in_progress';
+  task.startedAt = new Date();
+  const startTime = task.startedAt.toISOString();
+  task.logs.push(`[${startTime}] Task starting. Agent: ${agentForExecution.config.role} (ID: ${agentForExecution.id}).`);
+  console.log(
+    `Task '${task.config.description}' (ID: ${task.id}) starting execution by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Expected output: ${task.config.expectedOutput}`,
+  );
 
-  // Placeholder for task execution logic
-  // This will typically involve the assigned agent executing the task description
-  async execute(agentOverride?: Agent): Promise<string | object> {
-    const executionAgent = agentOverride ?? this.agent;
-    if (!executionAgent) {
-      throw new Error(
-        `Task '${this.description}' has no agent assigned and no agent was provided for execution.`,
-      );
-    }
-
-    console.log(
-      `Task '${this.description}' starting execution by agent ${executionAgent.role}. Expected output: ${this.expectedOutput}`,
+  try {
+    const result = await performAgentTask(agentForExecution, task.config.description, task.config.context);
+    task.output = result;
+    task.status = 'completed';
+    task.completedAt = new Date();
+    const endTime = task.completedAt.toISOString();
+    task.logs.push(
+      `[${endTime}] Task completed. Output: ${typeof result === 'string' ? result : JSON.stringify(result)}`,
     );
-
-    // The agent would use its LLM and tools here
-    const result = await executionAgent.executeTask(this.description, this.context);
-
-    this.output = result;
-    this.completed = true;
     console.log(
-      `Task '${this.description}' finished by agent ${executionAgent.role}. Output: ${result}`,
+      `Task '${task.config.description}' (ID: ${task.id}) finished by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Output: ${result}`,
     );
-    return result;
+  } catch (e) {
+    const error = e instanceof Error ? e : new Error(String(e));
+    task.status = 'failed';
+    task.error = error.message;
+    task.completedAt = new Date(); // Mark completion time even on failure
+    const endTime = task.completedAt.toISOString();
+    task.logs.push(`[${endTime}] Task failed. Error: ${error.message}`);
+    console.error(
+      `Task '${task.config.description}' (ID: ${task.id}) failed execution by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Error: ${task.error}`,
+    );
+    throw error; // Re-throw to allow callers to handle it
   }
+}
+
+// Helper functions to check task status
+export function isTaskCompleted(task: Task): boolean {
+  return task.status === 'completed';
+}
+
+export function hasTaskFailed(task: Task): boolean {
+  return task.status === 'failed';
+}
+
+export function isTaskPending(task: Task): boolean {
+  return task.status === 'pending';
+}
+
+export function isTaskInProgress(task: Task): boolean {
+  return task.status === 'in_progress';
 }
