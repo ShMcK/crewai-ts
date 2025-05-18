@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach, type Mock } from 'vitest';
 import { createAgent, performAgentTask, type AgentConfig, type Agent } from './index';
 import type { ChatLLM, ChatMessage, OpenAIConfig, AnthropicConfig } from '../llms';
 import type { Tool, ToolContext } from '../tools';
@@ -173,7 +173,7 @@ describe('performAgentTask with Memory', () => {
     expect(agent.history?.[1]).toEqual({ role: 'assistant', content: response1 });
 
     // Verify LLM call for task 1 (no prior history in prompt text itself, but mockLLM.chat receives full prompt)
-    const firstCallChatMock = mockLLM.chat as vi.Mock;
+    const firstCallChatMock = mockLLM.chat as Mock;
     expect(firstCallChatMock).toHaveBeenCalledTimes(1);
     const firstCallMessages = firstCallChatMock.mock.calls[0][0] as ChatMessage[];
     const firstPromptContent = firstCallMessages[0].content;
@@ -190,7 +190,7 @@ describe('performAgentTask with Memory', () => {
     expect(agent.history?.[3]).toEqual({ role: 'assistant', content: response2 });
 
     // Verify LLM call for task 2 (should include history)
-    const secondCallChatMock = mockLLM.chat as vi.Mock;
+    const secondCallChatMock = mockLLM.chat as Mock;
     expect(secondCallChatMock).toHaveBeenCalledTimes(2);
     const secondCallMessages = secondCallChatMock.mock.calls[1][0] as ChatMessage[];
     const secondPromptContent = secondCallMessages[0].content;
@@ -212,7 +212,7 @@ describe('performAgentTask with Memory', () => {
 
     expect(agentNoMemory.history).toBeUndefined(); // Still undefined
 
-    const chatMock = mockLLM.chat as vi.Mock;
+    const chatMock = mockLLM.chat as Mock;
     expect(chatMock).toHaveBeenCalledTimes(1); // Called once for this agent
     const promptContent = (chatMock.mock.calls[0][0] as ChatMessage[])[0].content;
     expect(promptContent).not.toMatch(/^user:/); // Should not start with history formatting
