@@ -5,6 +5,7 @@ import {
   type Task,
   type TaskConfig,
   isTaskCompleted,
+  TaskStatus,
   // Import other status helpers if needed: hasTaskFailed, isTaskPending, isTaskInProgress
 } from './index';
 import {
@@ -179,7 +180,7 @@ describe('Task System', () => {
     it('should skip execution if task is already completed', async () => {
       const taskConfig: TaskConfig = { description: 'Test', expectedOutput: 'Test' };
       const task = createTask(taskConfig);
-      task.status = 'completed'; // Manually set as completed
+      task.status = TaskStatus.COMPLETED; // Manually set as completed
       task.output = 'Already done';
 
       await executeTask(task, testAgent);
@@ -192,7 +193,7 @@ describe('Task System', () => {
     it('should skip execution if task is in_progress and not async', async () => {
       const taskConfig: TaskConfig = { description: 'Test', expectedOutput: 'Test', asyncExecution: false }; // Not async
       const task = createTask(taskConfig);
-      task.status = 'in_progress'; // Manually set as in_progress
+      task.status = TaskStatus.IN_PROGRESS; // Manually set as in_progress
       
       await executeTask(task, testAgent);
 
@@ -203,7 +204,7 @@ describe('Task System', () => {
     it('should re-execute if task is in_progress and async', async () => {
       const taskConfig: TaskConfig = { description: 'Test Async', expectedOutput: 'Test', asyncExecution: true }; // Async
       const task = createTask(taskConfig);
-      task.status = 'in_progress'; // Manually set as in_progress
+      task.status = TaskStatus.IN_PROGRESS; // Manually set as in_progress
       
       await executeTask(task, testAgent);
       expect(mockedPerformAgentTask).toHaveBeenCalledOnce(); // Should execute
@@ -223,11 +224,11 @@ describe('Task System', () => {
 
       await executeTask(task, testAgent);
 
-      expect(task.status).toBe('completed');
+      expect(task.status).toBe(TaskStatus.COMPLETED);
       expect(task.output).toEqual(mockLLMOutput);
       expect(task.parsedOutput).toEqual(mockLLMOutput); // Successfully parsed
       expect(task.validationError).toBeNull();
-      expect(task.logs.some(log => log.includes('Task output successfully validated'))).toBe(true);
+      expect(task.logs.some(log => log.includes('Output successfully parsed and validated against schema'))).toBe(true);
     });
 
     it('should store validationError and keep raw output if schema mismatches', async () => {
@@ -243,12 +244,12 @@ describe('Task System', () => {
 
       await executeTask(task, testAgent);
 
-      expect(task.status).toBe('completed'); // Still completed as per current design
-      expect(task.output).toEqual(mockLLMOutput);
-      expect(task.parsedOutput).toBeNull(); // Parsing failed
+      expect(task.status).toBe(TaskStatus.COMPLETED); // Task execution is complete, even if validation fails
+      expect(task.output).toEqual(mockLLMOutput);    // Raw output
+      expect(task.parsedOutput).toBeNull();
       expect(task.validationError).toBeInstanceOf(z.ZodError);
-      expect(task.validationError?.errors[0]?.message).toBe('Required'); // Example check for Zod error details
-      expect(task.logs.some(log => log.includes('Task output validation failed'))).toBe(true);
+      expect(task.validationError?.errors[0]?.message).toBe('Required'); // Example check for Zod error content
+      expect(task.logs.some(log => log.includes('Output parsing/validation failed'))).toBe(true);
     });
 
     it('should not attempt parsing and parsedOutput should be null if no schema is provided', async () => {
@@ -263,7 +264,7 @@ describe('Task System', () => {
 
       await executeTask(task, testAgent);
 
-      expect(task.status).toBe('completed');
+      expect(task.status).toBe(TaskStatus.COMPLETED);
       expect(task.output).toBe(mockLLMOutput);
       expect(task.parsedOutput).toBeNull();
       expect(task.validationError).toBeNull();
@@ -286,7 +287,7 @@ describe('Task System', () => {
 
       await expect(executeTask(task, testAgent)).rejects.toThrow('Execution error');
 
-      expect(task.status).toBe('failed');
+      expect(task.status).toBe(TaskStatus.FAILED);
       expect(task.output).toBeNull();
       expect(task.parsedOutput).toBeNull();
       expect(task.validationError).toBeNull();
@@ -425,7 +426,7 @@ describe('Task System', () => {
 
       await executeTask(task, testAgent);
 
-      expect(task.status).toBe('completed'); // Task itself should complete
+      expect(task.status).toBe(TaskStatus.COMPLETED); // Task itself should complete
       expect(task.output).toBe("some crucial output");
       expect(task.logs.some(log => log.includes(`Failed to save task output to ${baseOutputFilePath}. Error: ${fileErrorMessage}`))).toBe(true);
       expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining(`Failed to save task output for "${taskConfig.description}"`));

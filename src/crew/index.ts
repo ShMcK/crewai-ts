@@ -1,16 +1,15 @@
 // Crew definitions for crew-ai-ts
-import type { Agent, AgentConfig } from '../agents';
-import type { Task, TaskConfig } from '../tasks';
+import type { Agent } from '../agents';
+import type { Task } from '../tasks';
+import { TaskStatus } from '../tasks';
 import { CrewProcess } from '../core';
 import { v4 as uuidv4 } from 'uuid';
 import { executeTask } from '../tasks';
 import {
   type ChatLLM,
-  type OpenAIConfig,
   createOpenAIChatClient,
   type ChatMessage,
   type LLMProviderConfig,
-  type AnthropicConfig,
   createAnthropicChatClient,
   isOpenAIConfig,
   isAnthropicConfig
@@ -52,6 +51,15 @@ export interface Crew {
   startedAt?: Date;
   completedAt?: Date;
   telemetryEnabled?: boolean; // Assuming this might be added later for telemetry
+}
+
+// Type for tracking manager's attempts on tasks
+interface TaskAttemptInfoValue {
+  status: TaskStatus | 'failed_terminal' | 'skipped'; // Use Enum, add manager-specific ones for its logic
+  error?: string;
+  lastAgentId?: string;
+  lastAttemptIteration?: number;
+  attempts: number;
 }
 
 interface ManagerDecision {
@@ -243,7 +251,7 @@ ${crew.config.tasks.map((task) => `  - ${task.config.description} (ID: ${task.id
         }
         try {
           await executeTask(task, agentForExecution);
-          if (task.status === 'completed') {
+          if (task.status === TaskStatus.COMPLETED) {
             const taskDetail: TaskOutputDetail = {
               output: task.output,
               parsedOutput: task.parsedOutput,
@@ -252,7 +260,7 @@ ${crew.config.tasks.map((task) => `  - ${task.config.description} (ID: ${task.id
             };
             taskOutputs.set(task.id, taskDetail);
             finalOutput = task.parsedOutput !== null && task.parsedOutput !== undefined ? task.parsedOutput : task.output;
-          } else if (task.status === 'failed') {
+          } else if (task.status === TaskStatus.FAILED) {
             const taskDetail: TaskOutputDetail = {
               output: task.output,
               parsedOutput: task.parsedOutput,
@@ -295,19 +303,14 @@ ${crew.config.tasks.map((task) => `  - ${task.config.description} (ID: ${task.id
       const maxIterations = crew.config.tasks.length + 10; // Allow more iterations, e.g., for retries
 
       // Map to store attempt details: status ('pending', 'failed', 'completed'), error, lastAgentId
-      const taskAttemptInfo = new Map<string, {
-          status: 'pending' | 'failed' | 'completed';
-          error?: string;
-          lastAgentId?: string;
-          lastAttemptIteration?: number;
-      }>();
+      const taskAttemptInfo = new Map<string, TaskAttemptInfoValue>();
       for (const task of crew.config.tasks) {
-        taskAttemptInfo.set(task.id, { status: 'pending' });
+        taskAttemptInfo.set(task.id, { status: TaskStatus.PENDING, attempts: 0 });
       }
 
       // Function to get tasks that are not yet completed
       const getNonCompletedTasks = () => crew.config.tasks.filter(
-          task => taskAttemptInfo.get(task.id)?.status !== 'completed'
+          task => taskAttemptInfo.get(task.id)?.status !== TaskStatus.COMPLETED
       );
 
       while (getNonCompletedTasks().length > 0 && iterationCount < maxIterations) {
@@ -330,7 +333,7 @@ Tasks not yet completed: ${currentRemainingTasks.length}
           .map(t => {
             const attempt = taskAttemptInfo.get(t.id);
             let statusMarker = '';
-            if (attempt?.status === 'failed') {
+            if (attempt && attempt.status === TaskStatus.FAILED) {
               statusMarker = ` (Last attempt failed by agent ${attempt.lastAgentId || 'N/A'}. Error: ${attempt.error || 'Unknown error'})`;
             }
             return `- ${t.config.description} (Expected Output: ${t.config.expectedOutput}) (ID: ${t.id})${statusMarker}`;
@@ -344,7 +347,7 @@ Tasks not yet completed: ${currentRemainingTasks.length}
         
         const recentlyFailedTasksFeedback = crew.config.tasks
             .map(task => taskAttemptInfo.get(task.id))
-            .filter(attempt => attempt?.status === 'failed' && attempt.lastAttemptIteration === iterationCount -1) // Failed in the *immediately previous* iteration
+            .filter(attempt => attempt?.status === TaskStatus.FAILED && attempt.lastAttemptIteration === iterationCount -1) // Failed in the *immediately previous* iteration
             .map(attempt => {
                 const task = crew.config.tasks.find(t => taskAttemptInfo.get(t.id) === attempt); // Find task for description
                 return task ? `  - Task ID ${task.id} ("${task.config.description}") failed with error: ${attempt?.error}. Attempted by Agent ID ${attempt?.lastAgentId}.` : '';
@@ -516,19 +519,19 @@ ${managerDecisionText}
 
         await executeTask(taskToExecute, agentForExecution); // This mutates taskToExecute
 
-        // Update taskAttemptInfo based on the actual execution status
+        // Update taskAttemptInfo based on the actual execution status from taskToExecute (which is TaskStatus enum)
         const currentAttemptInfo = taskAttemptInfo.get(taskToExecute.id);
         if (currentAttemptInfo) {
             taskAttemptInfo.set(taskToExecute.id, {
                 ...currentAttemptInfo,
-                status: taskToExecute.status === 'completed' ? 'completed' : 'failed',
+                status: taskToExecute.status, // Directly use taskToExecute.status (it's already TaskStatus enum)
                 error: taskToExecute.error ? String(taskToExecute.error) : undefined,
                 lastAgentId: agentForExecution.id,
                 lastAttemptIteration: iterationCount,
             });
         }
 
-        if (taskToExecute.status === 'completed') {
+        if (taskToExecute.status === TaskStatus.COMPLETED) { // USE ENUM
           const taskDetail: TaskOutputDetail = {
             output: taskToExecute.output,
             parsedOutput: taskToExecute.parsedOutput,
@@ -541,7 +544,7 @@ ${managerDecisionText}
              const outputToLog = typeof taskToExecute.output === 'string' ? taskToExecute.output : JSON.stringify(taskToExecute.output);
              console.log(`\nTask Output (ID: ${taskToExecute.id}): ${outputToLog}\n`);
           }
-        } else if (taskToExecute.status === 'failed') {
+        } else if (taskToExecute.status === TaskStatus.FAILED) { // USE ENUM
           const taskDetail: TaskOutputDetail = {
             output: taskToExecute.output,
             parsedOutput: taskToExecute.parsedOutput,
@@ -698,6 +701,8 @@ ${finalOutput}
           console.log('\n[Crew AI] Hierarchical process finished, but no task outputs were recorded to summarize.');
       } else if (crew.config.verbose && !allTasksCompleted && (crew.managerLlmInstance || crew.managerAgentInstance)) {
           console.log('\n[Crew AI] Hierarchical process finished, but not all tasks were completed. Skipping manager summary.');
+      } else if (!allTasksCompleted && (crew.managerLlmInstance || crew.managerAgentInstance)) {
+        console.warn('[Crew AI Warning] Manager summary skipped because not all tasks were reported as completed by the manager loop.');
       }
       // --- END: Phase 2 ---
 

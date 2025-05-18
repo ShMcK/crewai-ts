@@ -4,8 +4,8 @@ import { createCrew, runCrew } from './index'; // Assuming named exports
 import type { Crew, CrewConfig, TaskOutputDetail } from './index';
 import type { Agent, AgentConfig } from '../agents';
 import { createAgent } from '../agents'; // Assuming factory function
-import type { Task, TaskConfig } from '../tasks';
-import { createTask, executeTask as originalExecuteTask } from '../tasks'; // Assuming factory and executeTask
+import { createTask, executeTask as originalExecuteTask, TaskStatus } from '../tasks'; // Assuming factory and executeTask
+import type { Task, TaskConfig } from '../tasks'; // Keep type imports separate if preferred or if other items are types only
 import type { ChatLLM, OpenAIConfig } from '../llms'; // Import ChatLLM
 import { performAgentTask as originalPerformAgentTask } from '../agents';
 import type { Tool, ToolContext } from '../tools'; // Added ToolContext
@@ -36,7 +36,6 @@ vi.mock('../tasks', async (importOriginal) => {
         rawOutput = { name: 'Test User', age: 'thirty' }; // age should be number
       }
 
-
       task.output = rawOutput;
 
       if (task.config.outputSchema) {
@@ -49,7 +48,7 @@ vi.mock('../tasks', async (importOriginal) => {
           task.validationError = parseResult.error;
         }
       }
-      task.status = 'completed';
+      task.status = TaskStatus.COMPLETED;
       task.logs.push(`Mock execution log for ${task.config.description}. Parsed: ${!!task.parsedOutput}`);
       task.completedAt = new Date();
     }),
@@ -343,12 +342,12 @@ describe('Crew', () => {
     it('should handle task execution failure and set crew status to FAILED', async () => {
       mockedExecuteTask.mockImplementationOnce(async (task: Task) => {
          task.output = `Raw output for ${task.config.description}`;
-         task.status = 'completed';
+         task.status = TaskStatus.COMPLETED;
          task.completedAt = new Date();
          if (task.config.outputSchema) { /* basic Zod handling if needed, or assume no schema */ }
       });
       mockedExecuteTask.mockImplementationOnce(async (task: Task) => {
-        task.status = 'failed';
+        task.status = TaskStatus.FAILED;
         task.error = 'Simulated task error';
         task.completedAt = new Date();
         task.logs.push('Simulated failure log');
