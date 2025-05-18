@@ -1,6 +1,15 @@
 // Tool definitions for crew-ai-ts
 
 /**
+ * Optional context that can be passed to a tool's execute method.
+ */
+export interface ToolContext {
+  taskDescription?: string;
+  originalTaskContext?: string; // Renamed from 'context' to avoid confusion with this interface name
+  // Add other relevant context fields as needed
+}
+
+/**
  * Represents a tool that an agent can use.
  * @template TInput The type of the input parameter for the tool's execute method.
  * @template TOutput The type of the output/result from the tool's execute method.
@@ -9,7 +18,7 @@ export interface Tool<TInput = unknown, TOutput = unknown> {
   name: string;
   description: string;
   // biome-ignore lint/suspicious/noExplicitAny: Flexible input for tools
-  execute: (input: TInput) => Promise<TOutput>;
+  execute: (input: TInput, context?: ToolContext) => Promise<TOutput>;
   // Optional: Define if the tool's output can be directly used as input for another task/agent
   // isOutputSharable?: boolean;
   // Optional: A schema for the expected input, could be a JSON schema object or a validation function.
@@ -45,7 +54,7 @@ export const simpleCalculatorTool: Tool<string, string> = {
   description:
     'A simple calculator that evaluates mathematical expressions. Input should be a string like "5 + 3" or "10 * 2 / 4".',
   // biome-ignore lint/security/noGlobalEval: This tool explicitly uses eval for calculations
-  async execute(expression: string): Promise<string> {
+  async execute(expression: string, _context?: ToolContext): Promise<string> {
     try {
       // biome-ignore lint/security/noGlobalEval: Core functionality of this specific tool
       const result = eval(expression);

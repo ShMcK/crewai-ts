@@ -160,7 +160,7 @@ export function createOpenAIChatClient(config: OpenAIConfig): ChatLLM<OpenAIConf
           );
         }
 
-        const data = await response.json() as { choices?: [{ message: ChatMessage }] };
+        const data = await response.json() as { choices?: { message: ChatMessage }[] };
         if (
           !data.choices ||
           !Array.isArray(data.choices) ||
