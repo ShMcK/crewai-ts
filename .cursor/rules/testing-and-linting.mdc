@@ -1,0 +1,34 @@
+---
+description:
+globs: **/*.ts
+alwaysApply: true
+---
+# Testing and Linting Guidelines
+
+All new functionality should be accompanied by comprehensive tests written using Vitest. Test files should follow the naming convention `*.spec.ts` and be co-located with the source files they are testing, or within a `__tests__` subdirectory if preferred.
+
+## Test Coverage
+Aim for high test coverage for all modules, including:
+- Unit tests for individual functions and components.
+- Integration tests for interactions between modules (e.g., agent-task interaction, crew execution).
+- Tests for different configurations and edge cases.
+- Mocking of external dependencies (LLM calls, tool executions where appropriate) to ensure tests are fast and reliable. Refer to existing tests like `[src/crew/index.spec.ts](mdc:src/crew/index.spec.ts)` for examples of mocking strategies using `vi.mock` and `vi.fn()`.
+
+## Linting and Testing Workflow
+Before committing or pushing changes, and especially before opening a Pull Request, ensure that all lint checks and tests pass.
+
+Execute the following commands from the root of the workspace:
+
+1.  **Run Linter:**
+    ```bash
+    pnpm lint
+    ```
+    This command will check the codebase for style and formatting issues using BiomeJS. Address any reported errors.
+
+2.  **Run Tests:**
+    ```bash
+    pnpm test
+    ```
+    This command will execute all `*.spec.ts` files using Vitest. All tests must pass.
+
+Adhering to these guidelines will help maintain code quality, prevent regressions, and ensure a stable codebase.
