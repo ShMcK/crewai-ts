@@ -3,7 +3,8 @@
 import type { Tool } from '../tools';
 import {
 	type LLM, type ChatLLM, type LLMConfig, type ChatMessage,
-	type OpenAIConfig, createOpenAIChatClient // Import factory
+	type OpenAIConfig, createOpenAIChatClient, type LLMProviderConfig, type AnthropicConfig, createAnthropicChatClient,
+	isOpenAIConfig, isAnthropicConfig
 } from '../llms';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -19,7 +20,7 @@ export interface AgentConfig {
 	goal: string;
 	backstory: string;
 	// LLM can be a pre-configured instance or a config object for a known provider
-	llm?: LLM | ChatLLM | OpenAIConfig; // Made more specific for OpenAI example
+	llm?: LLM | ChatLLM | LLMProviderConfig; // Use LLMProviderConfig
 	memory?: boolean;
 	tools?: Tool[];
 	allowDelegation?: boolean;
@@ -43,16 +44,23 @@ export function createAgent(config: AgentConfig): Agent {
 	let instantiatedLlm: LLM | ChatLLM | undefined;
 
 	if (config.llm) {
-		// Check if it's a config object that we know how to instantiate (e.g., OpenAIConfig)
-		// This is a simplified check. A more robust factory would inspect a 'provider' field or use type guards.
-		if ('apiKey' in config.llm && 'modelName' in config.llm && !('invoke' in config.llm) && !('chat' in config.llm)) {
-			// Assuming it's OpenAIConfig if it has apiKey and modelName, and no execute/chat methods
-			// In a real system, you might have a config.provider field to switch on.
+		// Check if it's a config object that we know how to instantiate
+		if (!('invoke' in config.llm) && !('chat' in config.llm)) {
+			const providerConfig = config.llm as LLMProviderConfig;
 			try {
-				instantiatedLlm = createOpenAIChatClient(config.llm as OpenAIConfig);
+				if (isOpenAIConfig(providerConfig)) {
+					instantiatedLlm = createOpenAIChatClient(providerConfig);
+				} else if (isAnthropicConfig(providerConfig)) {
+					instantiatedLlm = createAnthropicChatClient(providerConfig);
+				} else {
+					console.warn(
+						`Agent LLM config for '${config.role}' is not a recognized OpenAI or Anthropic config. LLM will be undefined. Config keys: ${Object.keys(providerConfig).join(', ')}`
+					);
+				}
 			} catch (e) {
-				console.error(`Failed to create OpenAI client for agent ${config.role}:`, e);
-				// Decide if agent should be created without LLM or throw
+				console.error(
+					`Failed to create LLM client for agent ${config.role} from provider config. Error: ${e instanceof Error ? e.message : String(e)}. LLM will be undefined.`
+				);
 			}
 		} else if ('invoke' in config.llm || 'chat' in config.llm) {
 			// It's already an instantiated LLM object
@@ -65,7 +73,7 @@ export function createAgent(config: AgentConfig): Agent {
 		}
 	}
 
-	return {
+	const agentResult = {
 		id: uuidv4(),
 		config,
 		llm: instantiatedLlm,
@@ -76,6 +84,7 @@ export function createAgent(config: AgentConfig): Agent {
 		verbose: config.verbose ?? false,
 		maxIter: config.maxIter ?? 25,
 	};
+	return agentResult;
 }
 
 // Renamed from Agent.executeTask to performAgentTask

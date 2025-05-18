@@ -1,9 +1,62 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { createAgent, performAgentTask, type AgentConfig, type Agent } from './index';
-import type { ChatLLM, ChatMessage, OpenAIConfig } from '../llms';
+import type { ChatLLM, ChatMessage, OpenAIConfig, AnthropicConfig } from '../llms';
 import type { Tool, ToolContext } from '../tools';
 
+// Mock LLM client creation and other LLM functions
+vi.mock('../llms', async (importOriginal) => {
+  const originalLLMs = await importOriginal<typeof import('../llms')>();
+
+  const mockCreateOpenAIChatClient = (config: OpenAIConfig) => {
+    const mockLLMObject = {
+      id: `mock-openai-${config.modelName || 'default'}`,
+      providerName: 'openai',
+      config,
+      chat: vi.fn().mockResolvedValue({ role: 'assistant', content: 'Mocked OpenAI chat' } as ChatMessage),
+      invoke: vi.fn().mockResolvedValue({ role: 'assistant', content: 'Mocked OpenAI invoke' } as ChatMessage),
+    };
+    return mockLLMObject;
+  };
+
+  const mockCreateAnthropicChatClient = (config: AnthropicConfig) => {
+    const mockLLMObject = {
+      id: `mock-anthropic-${config.modelName || 'default'}`,
+      providerName: 'anthropic',
+      config,
+      chat: vi.fn().mockResolvedValue({ role: 'assistant', content: 'Mocked Anthropic chat' } as ChatMessage),
+      invoke: vi.fn().mockResolvedValue({ role: 'assistant', content: 'Mocked Anthropic invoke' } as ChatMessage),
+    };
+    return mockLLMObject;
+  };
+
+  return {
+    // Keep original type guards and errors, etc.
+    isOpenAIConfig: originalLLMs.isOpenAIConfig,
+    isAnthropicConfig: originalLLMs.isAnthropicConfig,
+    OpenAIError: originalLLMs.OpenAIError,
+    AnthropicError: originalLLMs.AnthropicError,
+    // Add any other specific named exports from '../llms' that are NOT functions being mocked,
+    // but are used by the code under test or its direct imports from '../llms'.
+    // Types like ChatMessage, OpenAIConfig, etc., don't need to be here as they are compile-time.
+
+    // Mocked functions
+    createOpenAIChatClient: vi.fn(mockCreateOpenAIChatClient), // Wrap the actual function with vi.fn() for spying
+    createAnthropicChatClient: vi.fn(mockCreateAnthropicChatClient),
+  };
+});
+
 describe('Agent Creation', () => {
+  beforeEach(() => {
+    // Spy on console methods specifically for Agent Creation tests
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('should create an agent with default values', () => {
     const config: AgentConfig = {
       role: 'Test Role',
@@ -31,7 +84,7 @@ describe('Agent Creation', () => {
       description: 'A tool for testing',
       execute: async (input: unknown, _context?: ToolContext) => `Tool output for ${String(input)}`,
     };
-    const llmConfig = { modelName: 'test-llm', apiKey: 'test-key' } as OpenAIConfig;
+    const llmConfig = { modelName: 'gpt-test-llm', apiKey: 'test-key' } as OpenAIConfig;
     const config: AgentConfig = {
       role: 'Advanced Tester',
       goal: 'Thoroughly test everything',
@@ -53,7 +106,7 @@ describe('Agent Creation', () => {
     expect(agent.llm).toBeDefined();
     expect(agent.llm?.providerName).toBe('openai');
     if (agent.llm) {
-      expect(agent.llm.config.modelName).toBe('test-llm');
+      expect(agent.llm.config.modelName).toBe('gpt-test-llm');
     }
 
     expect(agent.memory).toBe(true);

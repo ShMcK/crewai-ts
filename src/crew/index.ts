@@ -9,6 +9,11 @@ import {
   type OpenAIConfig,
   createOpenAIChatClient,
   type ChatMessage,
+  type LLMProviderConfig,
+  type AnthropicConfig,
+  createAnthropicChatClient,
+  isOpenAIConfig,
+  isAnthropicConfig
 } from '../llms'; // Import necessary LLM types and factory
 import { performAgentTask } from '../agents';
 import type { z } from 'zod'; // Add Zod import
@@ -21,7 +26,7 @@ export interface CrewConfig {
   tasks: Task[];
   process?: CrewProcess;
   verbose?: boolean | number;
-  managerLlm?: ChatLLM | OpenAIConfig | Agent; // Allow Agent as manager
+  managerLlm?: ChatLLM | LLMProviderConfig | Agent; // Use LLMProviderConfig
   objective?: string;
   shareCrew?: boolean;
 }
@@ -94,43 +99,39 @@ export function createCrew(config: CrewConfig): Crew {
 
     const managerInput = config.managerLlm;
 
-    // Check 1: Is it an Agent instance (conforming to our Agent interface)?
-    if (
-      managerInput &&
-      typeof (managerInput as Agent).id === 'string' &&
-      typeof (managerInput as Agent).config === 'object' && // Holds role, goal, backstory, llm config etc.
-      typeof (managerInput as Agent).llm === 'object' && // Instantiated LLM for the agent
-      Array.isArray((managerInput as Agent).tools)
-      // We don't check for executeTask, interpolateInput, etc. on the Agent instance itself
-      // as these are standalone functions in our functional approach.
-    ) {
+    // Check 1: Is it an Agent instance?
+    if (managerInput && typeof (managerInput as Agent).config?.role === 'string' && Array.isArray((managerInput as Agent).tools)) {
       instantiatedManagerAgent = managerInput as Agent;
-      // The managerAgentInstance itself will be used. Its internal LLM is what matters.
-      if (!instantiatedManagerAgent.llm) { // Double check, though covered by the type guard essentially
-        console.warn(`Warning: Manager Agent "${instantiatedManagerAgent.config.role}" (ID: ${instantiatedManagerAgent.id}) does not have an LLM instantiated. This should not happen if type guards are correct.`);
-      }
     } 
     // Check 2: Is it an already instantiated ChatLLM instance (but not an Agent)?
     else if (
       managerInput &&
       (typeof (managerInput as ChatLLM).chat === 'function' || typeof (managerInput as ChatLLM).invoke === 'function') &&
-      // Ensure it's not also identifiable as our Agent interface (e.g. lacks a .config.role or .tools array)
       !(typeof (managerInput as Agent).config?.role === 'string' && Array.isArray((managerInput as Agent).tools))
     ) {
       instantiatedManagerLlm = managerInput as ChatLLM;
     } 
-    // Check 3: Is it an OpenAIConfig that needs instantiation?
+    // Check 3: Is it a known LLMProviderConfig that needs instantiation?
     else if (
-      managerInput &&
-      typeof (managerInput as OpenAIConfig).apiKey === 'string' &&
-      typeof (managerInput as OpenAIConfig).modelName === 'string' &&
-      !(typeof (managerInput as ChatLLM).chat === 'function') && 
-      !(typeof (managerInput as Agent).config?.role === 'string' && Array.isArray((managerInput as Agent).tools))
+      managerInput && 
+      !('chat' in managerInput) && !('invoke' in managerInput) && // Not already instantiated
+      'apiKey' in managerInput && 'modelName' in managerInput      // Common properties for our configs
     ) {
+      const providerConfig = managerInput as LLMProviderConfig;
       try {
-        instantiatedManagerLlm = createOpenAIChatClient(managerInput as OpenAIConfig);
+        if (isOpenAIConfig(providerConfig)) {
+          instantiatedManagerLlm = createOpenAIChatClient(providerConfig);
+        } else if (isAnthropicConfig(providerConfig)) {
+          instantiatedManagerLlm = createAnthropicChatClient(providerConfig);
+        } else {
+          throw new Error(
+            `Crew creation failed: managerLlm for hierarchical process is an unrecognized LLMProviderConfig. Config keys: ${Object.keys(providerConfig).join(', ')}`
+          );
+        }
       } catch (e) {
-        throw new Error(`Failed to create manager LLM from OpenAIConfig for hierarchical crew: ${e instanceof Error ? e.message : String(e)}`);
+        throw new Error(
+          `Crew creation failed: Could not instantiate managerLlm from the provided config. Error: ${e instanceof Error ? e.message : String(e)}`
+        );
       }
     } 
     else {
