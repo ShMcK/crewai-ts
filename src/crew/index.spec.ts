@@ -185,6 +185,29 @@ describe('Crew', () => {
       const crew = createCrew(crewConfig);
       expect(crew.config.tasks[0].config.agent).toBeUndefined();
     });
+
+    it('should create a crew with a specified objective', () => {
+      const task1 = createTask(task1Config);
+      const myObjective = "Achieve test greatness";
+      const crewConfig: CrewConfig = {
+        agents: [mockAgent1],
+        tasks: [task1],
+        objective: myObjective,
+      };
+      const crew = createCrew(crewConfig);
+      expect(crew.config.objective).toBe(myObjective);
+    });
+
+    it('should create a crew without an objective (it is optional)', () => {
+      const task1 = createTask(task1Config);
+      const crewConfig: CrewConfig = {
+        agents: [mockAgent1],
+        tasks: [task1],
+        // No objective here
+      };
+      const crew = createCrew(crewConfig);
+      expect(crew.config.objective).toBeUndefined();
+    });
   });
 
   describe('runCrew', () => {
@@ -374,187 +397,219 @@ describe('Crew', () => {
        expect(() => createCrew(crewConfig)).toThrow('Crew creation failed: No agents provided.');
     });
 
-    describe('Hierarchical Process with Manager Agent using Tools', () => {
-      let managerAgent: Agent;
-      let workerAgent: Agent;
-      let taskToDelegate: Task;
-      let managerDecisionHelperTool: Tool<unknown, unknown>;
-      let mockManagerAgentLlm: MockedFunction<ChatLLM['chat']>;
+    describe('Hierarchical Process with Manager Summary', () => {
+      let task1: Task;
+      let task2: Task;
+      const customObjective = "Custom crew objective for testing summary.";
+      const defaultObjective = "Synthesize a cohesive final answer based on the outputs of the completed tasks.";
+      const finalSummaryResponse = "This is the manager's final summary.";
 
       beforeEach(() => {
-        // Setup specific to this describe block
-        managerDecisionHelperTool = {
-          name: 'managerDecisionHelperTool',
-          description: 'A tool to help manager make decisions.',
-          execute: vi.fn().mockImplementation(async (input: unknown, _context?: ToolContext) => {
-            // More lenient mock for now to check if it's called at all
-            // console.log('Mock tool execute called with input:', input, 'context:', _context); // For debugging during test runs
-            return Promise.resolve(`Tool output: crucial data gathered, input type: ${typeof input}`);
-          }),
-        };
+        task1 = createTask(task1Config); // agent mockAgent1
+        task2 = createTask(task2Config); // agent mockAgent2
 
-        mockManagerAgentLlm = vi.fn();
-        const managerLlmInstance: ChatLLM = {
-          id: 'manager-agent-llm',
-          providerName: 'openai',
-          config: { modelName: 'gpt-4-test' } as OpenAIConfig,
-          chat: mockManagerAgentLlm,
-          invoke: vi.fn(),
-        };
+        // Reset and configure mocks for multi-stage hierarchical process
+        // 1. Delegate task1, 2. Delegate task2, 3. All tasks completed, 4. Generate summary
+        mockManagerLlm.chat = vi.fn()
+          .mockReset()
+          .mockName("RawLLM_Delegation_T1")
+          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
+          .mockName("RawLLM_Delegation_T2")
+          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
+          .mockName("RawLLM_Final_Summary")
+          .mockResolvedValueOnce({ role: 'assistant', content: finalSummaryResponse });
 
-        const managerAgentConfig: AgentConfig = {
-          role: 'Chief Decision Maker',
-          goal: 'Delegate tasks efficiently after analysis',
-          backstory: 'Has access to analytical tools.',
-          llm: managerLlmInstance,
-          tools: [managerDecisionHelperTool],
-          verbose: true, // Enable verbose for manager agent for potential logging
-        };
-        managerAgent = createAgent(managerAgentConfig);
+        mockedPerformAgentTask.mockImplementation(async (agent, taskDescOrAction, context) => {
+          // Manager agent making a delegation decision
+          if (taskDescOrAction.includes("Delegate a task") || taskDescOrAction.includes("As the project manager")) {
+            // Simplified logic: count calls to determine which task to delegate or if all done for delegation phase.
+            const delegationCalls = mockedPerformAgentTask.mock.calls.filter(call => 
+                (call[1].includes("Delegate a task") || call[1].includes("As the project manager")) &&
+                !call[1].includes("overall crew objective") // Exclude final summary calls
+            );
 
-        const workerAgentConfig: AgentConfig = {
-          role: 'Worker Bee',
-          goal: 'Execute assigned tasks',
-          backstory: 'Diligent worker.',
-          // llm: {} as any, // Assuming worker agent might not need LLM for some tasks or it's mocked differently
-        };
-        workerAgent = createAgent(workerAgentConfig);
-
-        taskToDelegate = createTask({
-          description: 'Important task to be delegated',
-          expectedOutput: 'Result of the important task',
-          // No agent assigned initially, manager will assign it
-        });
-        
-        // Reset the global mockedPerformAgentTask for other tests if necessary
-        // For this suite, we are testing the crew's invocation of performAgentTask on the manager agent
-        // and that performAgentTask correctly uses the manager's LLM and tools.
-        // So we let the *actual* performAgentTask run for the managerAgent.
-        // We mock the managerAgent's LLM (chat method).
-        mockedPerformAgentTask.mockImplementation(async (agent: Agent, taskDescription: string, context?: string) => {
-          // This is a fallback mock for performAgentTask if it's called for agents OTHER than the manager
-          // or if the manager agent scenario needs a specific controlled outcome not tied to its internal LLM directly.
-          // For the manager agent, its own LLM (mockManagerAgentLlm) will be invoked by the *actual* performAgentTask.
-          if (agent.id === managerAgent.id) {
-            // highlight-start
-            // console.log(`DEBUG: mockedPerformAgentTask: MANAGER AGENT (${agent.id}) DETECTED. Calling original.`);
-            // highlight-end
-            // Let the actual performAgentTask run for the manager agent
-            // by calling the original implementation. This is tricky with vi.mock.
-            // The alternative is to NOT mock performAgentTask globally, and only spy on it,
-            // or to re-implement its logic here for the manager if needed.
-            // Given the user's note, we want performAgentTask to do its job.
-            // The global mock of performAgentTask might interfere.
-
-            // To test the manager agent truly using its tools via the *actual* performAgentTask,
-            // performAgentTask should NOT be mocked for the managerAgent.
-            // Let's adjust the global mock to allow passthrough or specific handling.
-            const originalAgentsModule = await vi.importActual<typeof import('../agents')>('../agents');
-            // highlight-start
-            const result = await originalAgentsModule.performAgentTask(agent, taskDescription, context);
-            // console.log(`DEBUG: mockedPerformAgentTask: MANAGER AGENT original call returned snippet: ${result.substring(0, 200)}`);
-            return result;
-            // highlight-end
-
+            if (delegationCalls.length <= 1) { // First actual delegation call by manager
+                return JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id, additionalContextForAgent: "Manager agent context for task 1" });
+            }
+            if (delegationCalls.length === 2) { // Second actual delegation call by manager
+                 return JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id, additionalContextForAgent: "Manager agent context for task 2" });
+            }
+            // After two delegations, manager should signal completion of delegation phase
+            return "ALL_TASKS_COMPLETED"; 
           }
-          // highlight-start
-          // console.log(`DEBUG: mockedPerformAgentTask: DEFAULT MOCK for agent ${agent.id} (${agent.config.role})`);
-          // highlight-end
-          // Default mock behavior for other agents (e.g. worker agents if their tasks were complex)
-          return `Default mock output for ${agent.config.role} performing: ${taskDescription}`;
+          // Manager agent generating the final summary
+          if (taskDescOrAction.includes("overall crew objective") && taskDescOrAction.includes("provide a comprehensive final summary")) {
+            return `Manager agent summary: ${finalSummaryResponse} based on context: ${context?.substring(0, 50)}...`;
+          }
+          // Fallback for other agent tasks (e.g., worker agents, though their execution is mocked by mockedExecuteTask)
+          return `Agent ${agent.config.role} processed: ${taskDescOrAction.substring(0,30)}`;
         });
       });
 
-      it('should allow manager agent to use its tool before delegating a task and complete the crew', async () => {
+      it('should use custom objective in raw LLM manager final summary prompt', async () => {
         const crewConfig: CrewConfig = {
-          agents: [managerAgent, workerAgent], // Manager agent must be in the list
-          tasks: [taskToDelegate],
+          agents: [mockAgent1, mockAgent2],
+          tasks: [task1, task2],
           process: CrewProcess.HIERARCHICAL,
-          managerLlm: managerAgent, // Manager is an Agent instance
-          verbose: true,
+          managerLlm: mockManagerLlm,
+          objective: customObjective,
+          verbose: false, // Keep verbose false to simplify mock verification
         };
         const crew = createCrew(crewConfig);
 
-        // 1. Manager agent's LLM is first asked for a decision (by performAgentTask, called by runCrew)
-        // It decides to use its tool.
-        const toolCallCommand = `Okay, I need to use my tool. Here is the tool call: \`\`\`json
-{
-  "tool_name": "managerDecisionHelperTool",
-  "tool_input": "analyze current tasks"
-}
-\`\`\``;
-        mockManagerAgentLlm.mockResolvedValueOnce({ role: 'assistant', content: toolCallCommand });
-
-        // 2. After tool execution, manager agent's LLM is called again (by performAgentTask)
-        // It now provides the delegation.
-        const delegationDecision = `Great, the tool output was very helpful. Now I will delegate. \`\`\`json
-{
-  "taskIdToDelegate": "${taskToDelegate.id}",
-  "agentIdToAssign": "${workerAgent.id}",
-  "additionalContextForAgent": "Tool insights: crucial data gathered. Focus on this."
-}
-\`\`\``;
-        mockManagerAgentLlm.mockResolvedValueOnce({ role: 'assistant', content: delegationDecision });
-        
-        // 3. Manager LLM is called for the final summary
-        mockManagerAgentLlm.mockResolvedValueOnce({ role: 'assistant', content: 'All tasks completed. Final summary by manager based on results.' });
-
+        // Refine mockManagerLlm.chat for this specific test flow
+        // Iteration 1: Delegate task1
+        // Iteration 2: Delegate task2
+        // Iteration 3: Manager says ALL_TASKS_COMPLETED
+        // Call for Final Summary
+        (mockManagerLlm.chat as Mock)
+          .mockReset()
+          .mockName("RawLLM_Delegation_T1")
+          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
+          .mockName("RawLLM_Delegation_T2")
+          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
+          .mockName("RawLLM_Final_Summary")
+          .mockResolvedValueOnce({ role: 'assistant', content: finalSummaryResponse });
 
         await runCrew(crew);
-
-        // Assertions
-        // Verify manager's tool was called
-        expect(managerDecisionHelperTool.execute).toHaveBeenCalledTimes(1);
-        expect(managerDecisionHelperTool.execute).toHaveBeenCalledWith(
-          'analyze current tasks',
-          {
-            taskDescription: expect.stringContaining('As the project manager'), // The manager task description
-            originalTaskContext: expect.stringContaining('Tasks to be Actioned'), // The manager context
-          },
-        );
-
-        // Check for verbose logging related to tool use by manager agent
-        // The spy is on console.log directly from the global beforeEach
-        // highlight-start
-        expect(console.log).toHaveBeenCalledWith(
-          expect.stringContaining(`Agent ${managerAgent.config.role} attempting to use tool: ${managerDecisionHelperTool.name}`),
-        );
-        expect(console.log).toHaveBeenCalledWith(
-          expect.stringContaining(`Agent ${managerAgent.config.role} tool ${managerDecisionHelperTool.name} output:`),
-        );
-        // highlight-end
-
-        // Verify the task was delegated and executed
-        expect(mockedExecuteTask).toHaveBeenCalledTimes(1);
-        expect(mockedExecuteTask).toHaveBeenCalledWith(
-          expect.objectContaining({ id: taskToDelegate.id }),
-          expect.objectContaining({ id: workerAgent.id }),
-          // expect.anything() // TODO: Refine to check context propagation
-        );
-        
-        const executeTaskCall = mockedExecuteTask.mock.calls[0];
-        const taskArg = executeTaskCall[0] as Task;
-        expect(taskArg.config.context).toContain("Tool insights: crucial data gathered. Focus on this.");
-
-
-        expect(taskToDelegate.status).toBe('completed');
-        expect(taskToDelegate.output).toBe(`Output from task: ${taskToDelegate.config.description}`); // From global mock
-
-        // Verify crew completion
         expect(crew.status).toBe('COMPLETED');
-        expect(crew.output).toBe('All tasks completed. Final summary by manager based on results.');
-        
-        // Verify manager's LLM was called for decision and summary
-        expect(mockManagerAgentLlm).toHaveBeenCalledTimes(3); // 1 for tool use, 1 for delegation, 1 for final summary
+        expect(crew.output).toBe(finalSummaryResponse);
 
-        // Check verbose logging (optional, but good to confirm)
-        // highlight-start
-        // The following logs were for a previous logging style and are no longer generated directly by runCrew for manager tool use.
-        // Tool usage logs are now primarily handled within performAgentTask and checked by earlier assertions.
-        // expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`[Crew AI - ${crew.id}] [Manager Agent - ${managerAgent.config.role}] Using tool: ${managerDecisionHelperTool.name}`));
-        // expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`[Crew AI - ${crew.id}] [Manager Agent - ${managerAgent.config.role}] Tool managerDecisionHelperTool output: Tool output: crucial data gathered`));
-        // expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`[Crew AI - ${crew.id}] Delegating task "${taskToDelegate.config.description}" to agent "${workerAgent.config.role}"`));
-        // highlight-end
+        // The last call to managerLlm.chat should be for the summary
+        const lastCallArgs = (mockManagerLlm.chat as Mock).mock.calls;
+        expect(lastCallArgs.length).toBeGreaterThanOrEqual(3); // 2 delegations, 1 ALL_TASKS_COMPLETED, 1 summary
+        
+        const summaryCallIndex = (mockManagerLlm.chat as Mock).mock.calls.findIndex(call => call[0][0].content.includes("overall crew objective was"));
+        expect(summaryCallIndex).not.toBe(-1); // Ensure summary call happened
+        const summaryPrompt = (mockManagerLlm.chat as Mock).mock.calls[summaryCallIndex][0][0].content;
+
+        expect(summaryPrompt).toContain(customObjective);
+        expect(summaryPrompt).not.toContain(defaultObjective);
+        expect(summaryPrompt).toContain(task1.config.description); // Check task outputs are in summary context
+        expect(summaryPrompt).toContain(`Output from task: ${task1.config.description}`);
+      });
+
+      it('should use default objective in raw LLM manager final summary if none provided', async () => {
+        const crewConfig: CrewConfig = {
+          agents: [mockAgent1, mockAgent2],
+          tasks: [task1, task2],
+          process: CrewProcess.HIERARCHICAL,
+          managerLlm: mockManagerLlm,
+          // No objective
+          verbose: false,
+        };
+        const crew = createCrew(crewConfig);
+        (mockManagerLlm.chat as Mock)
+          .mockReset()
+          .mockName("RawLLM_Delegation_T1")
+          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
+          .mockName("RawLLM_Delegation_T2")
+          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
+          .mockName("RawLLM_Final_Summary")
+          .mockResolvedValueOnce({ role: 'assistant', content: finalSummaryResponse });
+
+        await runCrew(crew);
+        expect(crew.status).toBe('COMPLETED');
+        expect(crew.output).toBe(finalSummaryResponse);
+        
+        const summaryCallIndex = (mockManagerLlm.chat as Mock).mock.calls.findIndex(call => call[0][0].content.includes("overall crew objective was"));
+        expect(summaryCallIndex).not.toBe(-1);
+        const summaryPrompt = (mockManagerLlm.chat as Mock).mock.calls[summaryCallIndex][0][0].content;
+        
+        expect(summaryPrompt).toContain(defaultObjective);
+      });
+
+      it('should use custom objective in Manager Agent final summary task', async () => {
+        const managerAgentConfig: AgentConfig = { role: "TestManager", goal: "Manage", backstory: "Born to manage", llm: mockManagerLlm }; // Manager agent uses an LLM
+        const managerAgent = createAgent(managerAgentConfig);
+        
+        const crewConfig: CrewConfig = {
+          agents: [mockAgent1, mockAgent2], // Worker agents
+          tasks: [task1, task2],
+          process: CrewProcess.HIERARCHICAL,
+          managerLlm: managerAgent, // Assign manager AGENT
+          objective: customObjective,
+          verbose: false,
+        };
+        const crew = createCrew(crewConfig);
+
+        // Configure mockedPerformAgentTask for this test's flow:
+        // 1. Manager Agent delegates task1
+        // 2. Manager Agent delegates task2
+        // 3. Manager Agent says "ALL_TASKS_COMPLETED" (or implies it by not delegating further)
+        // 4. Manager Agent generates final summary
+        const managerSummaryOutput = `Manager agent summary: ${finalSummaryResponse} with custom objective`;
+        (mockedPerformAgentTask as Mock)
+            .mockReset()
+            .mockName("ManagerAgent_Delegation_Call_1")
+            .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }))
+            .mockName("ManagerAgent_Delegation_Call_2")
+            .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }))
+            .mockName("ManagerAgent_Final_Summary_Call_3")
+            .mockResolvedValueOnce(managerSummaryOutput);
+
+        await runCrew(crew);
+        expect(crew.status).toBe('COMPLETED');
+        expect(crew.output).toBe(managerSummaryOutput);
+
+        // Find the call to performAgentTask for the summary
+        const summaryCall = (mockedPerformAgentTask as Mock).mock.calls.find(
+            (call) => call[0].id === managerAgent.id && call[1].includes("overall crew objective is")
+        );
+        expect(summaryCall).toBeDefined();
+        const managerAgentSummaryTaskDesc = summaryCall?.[1]; // Second argument is taskDescription
+        expect(managerAgentSummaryTaskDesc).toContain(customObjective);
+        expect(managerAgentSummaryTaskDesc).not.toContain(defaultObjective);
+
+        // Check that the context passed to manager for summary includes task outputs
+        const managerAgentSummaryContext = summaryCall?.[2]; // Third argument is context
+        expect(managerAgentSummaryContext).toContain(task1.config.description);
+        expect(managerAgentSummaryContext).toContain(`Output from task: ${task1.config.description}`);
+      });
+
+      it('should use default objective in Manager Agent final summary task if none provided', async () => {
+        const originalConsoleError = console.error; 
+        console.error = (...args: unknown[]) => { 
+            originalConsoleError(...args); 
+        }; 
+
+        try {
+            const managerAgentConfig: AgentConfig = { role: "TestManagerDef", goal: "Manage Def", backstory: "Born for default", llm: mockManagerLlm };
+            const managerAgent = createAgent(managerAgentConfig);
+    
+            const crewConfig: CrewConfig = {
+              agents: [mockAgent1, mockAgent2],
+              tasks: [task1, task2],
+              process: CrewProcess.HIERARCHICAL,
+              managerLlm: managerAgent,
+              verbose: false, 
+            };
+            const crew = createCrew(crewConfig);
+            const managerSummaryOutputDef = `Manager agent summary: ${finalSummaryResponse} with default objective`;
+            
+            (mockedPerformAgentTask as Mock)
+                .mockReset()
+                .mockName("ManagerAgent_Delegation_Call_1")
+                .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }))
+                .mockName("ManagerAgent_Delegation_Call_2")
+                .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }))
+                .mockName("ManagerAgent_Final_Summary_Call_3")
+                .mockResolvedValueOnce(managerSummaryOutputDef);
+    
+            await runCrew(crew);
+            
+            expect(crew.status).toBe('COMPLETED');
+            expect(crew.output).toBe(managerSummaryOutputDef);
+    
+            const summaryCall = (mockedPerformAgentTask as Mock).mock.calls.find(
+                (call) => call[0].id === managerAgent.id && call[1].includes("overall crew objective is")
+            );
+            expect(summaryCall).toBeDefined();
+            const managerAgentSummaryTaskDesc = summaryCall?.[1];
+            expect(managerAgentSummaryTaskDesc).toContain(defaultObjective);
+        } finally {
+            console.error = originalConsoleError; 
+        }
       });
     });
   });

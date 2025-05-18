@@ -21,6 +21,7 @@ export interface CrewConfig {
   process?: CrewProcess;
   verbose?: boolean | number;
   managerLlm?: ChatLLM | OpenAIConfig | Agent; // Allow Agent as manager
+  objective?: string;
   shareCrew?: boolean;
 }
 
@@ -523,37 +524,57 @@ ${managerDecisionText}
             .filter(([, result]) => !(result.output && typeof result.output === 'object' && 'error' in result.output))
             .map(([taskId, result]) => {
               const task = crew.config.tasks.find(t => t.id === taskId);
-              return `Task: ${task?.config.description || taskId}
-Output: ${typeof result.output === 'string' ? result.output : JSON.stringify(result.output)}`;
+              return `Task: ${task?.config.description || taskId}\nOutput: ${typeof result.output === 'string' ? result.output : JSON.stringify(result.output)}`;
             })
             .join('\n\n');
 
           if (successfulTaskOutputsSummary) {
+            const crewObjective = crew.config.objective || "Synthesize a cohesive final answer based on the outputs of the completed tasks.";
+
+            // Prompt for direct LLM call (if managerLlmInstance is used)
             const finalSummaryPrompt = `
-All assigned tasks have been completed. Based on the following task outputs, please provide a comprehensive final summary or answer that fulfills the overall crew objective.
+All assigned tasks have been completed. The overall crew objective was: "${crewObjective}".
+
+Based on the following task outputs, please provide a comprehensive final summary or answer that fulfills this objective.
 
 Summary of Successfully Completed Task Outputs:
 ${successfulTaskOutputsSummary}
 
-Crew Objective (inferred from tasks): [Consider dynamically generating a crew objective summary if not explicitly provided in CrewConfig later]
-Based on the provided outputs, synthesize the final result.
+Synthesize the final result based on the objective and the provided outputs.
 `;
+
             try {
-              const summaryMessages: ChatMessage[] = [{ role: 'user', content: finalSummaryPrompt }];
               if (crew.config.verbose) {
-                  console.log(`Manager Final Summary Prompt:
-${finalSummaryPrompt.substring(0,500)}...
+                  console.log(`Manager Final Summary Task Description (Objective: "${crewObjective}"):
+Synthesize a final report based on the overall crew objective and the following task outputs.
+Context (Task Outputs Summary):
+${successfulTaskOutputsSummary.substring(0,300)}...
 `);
               }
-              // Use manager agent's LLM if available and it supports chat, otherwise the direct manager LLM instance
+              
               let summaryMade = false;
-              if (crew.managerAgentInstance?.llm && typeof (crew.managerAgentInstance.llm as ChatLLM).chat === 'function') {
-                  const summaryResponse = await (crew.managerAgentInstance.llm as ChatLLM).chat(summaryMessages);
-                  finalOutput = summaryResponse.content;
+              if (crew.managerAgentInstance) { // Prioritize manager agent
+                  const finalSummaryTaskForAgent = `
+The overall crew objective is: "${crewObjective}".
+
+Based on this objective and the following summaries of successfully completed task outputs, please provide a comprehensive final summary or answer that fulfills the crew's purpose.
+Ensure your response is a direct, final answer to the collective goal, not a meta-commentary on the summarization process itself.`;
+                  const finalSummaryContextForAgent = `
+Summary of Successfully Completed Task Outputs:
+${successfulTaskOutputsSummary}
+`;
+                  finalOutput = await performAgentTask(crew.managerAgentInstance, finalSummaryTaskForAgent, finalSummaryContextForAgent);
                   summaryMade = true;
               } else if (crew.managerLlmInstance) { 
+                  // Fallback to direct LLM call if no manager agent, but manager LLM exists
+                  const summaryMessages: ChatMessage[] = [{ role: 'user', content: finalSummaryPrompt }];
+                   if (crew.config.verbose) { // Also log raw prompt if using direct LLM
+                      console.log(`Manager Final Summary Prompt (Raw LLM):
+${finalSummaryPrompt.substring(0,500)}...
+`);
+                  }
                   const summaryResponse = await crew.managerLlmInstance.chat(summaryMessages);
-                  finalOutput = summaryResponse.content; // Manager's summarized output
+                  finalOutput = summaryResponse.content; 
                   summaryMade = true;
               } else {
                   // This case means no suitable LLM was found for summarization.
