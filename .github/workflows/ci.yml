@@ -3,10 +3,10 @@ name: CI
 on:
   pull_request:
     branches:
-      - main # Or your primary branch, e.g., master
+      - main
   push:
     branches:
-      - main # Also run on pushes to main for good measure
+      - main
 
 jobs:
   lint_and_test:
@@ -19,7 +19,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10 # Specify your pnpm version from package.json packageManager field if more specific
+          version: 10
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
