@@ -8,6 +8,11 @@ pnpm lint || {
   exit 1
 }
 
+pnpm typecheck || {
+  echo "Typecheck failed. Aborting push."
+  exit 1
+}
+
 pnpm test || {
   echo "Tests failed. Aborting push."
   exit 1
