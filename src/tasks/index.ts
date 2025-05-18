@@ -2,6 +2,8 @@
 import { type Agent, performAgentTask } from '../agents';
 import { v4 as uuidv4 } from 'uuid';
 import type { z, ZodTypeAny } from 'zod';
+import * as fs from 'node:fs'; // Import fs module with node: protocol
+import * as path from 'node:path'; // Import path module with node: protocol
 
 // Task Configuration (Input to create a task)
 export interface TaskConfig {
@@ -11,6 +13,7 @@ export interface TaskConfig {
   context?: string; // Data from other tasks or initial context
   asyncExecution?: boolean; // Hint for the crew on how to run this
   outputSchema?: ZodTypeAny; // Use ZodTypeAny
+  outputFile?: string; // Path to save the task output
   // Example of a potential future config property:
   // toolNames?: string[]; // Specify tools required/allowed for this task
 }
@@ -109,24 +112,53 @@ export async function executeTask(
       `Task '${task.config.description}' (ID: ${task.id}) finished by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Output: ${task.output}`,
     );
 
+    // Save output to file if specified
+    if (task.config.outputFile) {
+      const outputToSave =
+        task.parsedOutput !== null &&
+        task.parsedOutput !== undefined &&
+        !task.validationError
+          ? task.parsedOutput
+          : task.output;
+      try {
+        const filePath = path.resolve(task.config.outputFile);
+        const dirPath = path.dirname(filePath);
+        if (!fs.existsSync(dirPath)) {
+          fs.mkdirSync(dirPath, { recursive: true });
+          task.logs.push(`[${new Date().toISOString()}] Created directory for output file: ${dirPath}`);
+        }
+        fs.writeFileSync(filePath, JSON.stringify(outputToSave, null, 2));
+        task.logs.push(`[${new Date().toISOString()}] Task output saved to ${filePath}`);
+        console.log(`Task output for "${task.config.description}" (ID: ${task.id}) saved to ${filePath}`);
+      } catch (fileError: unknown) {
+        const fileErrorMessage = fileError instanceof Error ? fileError.message : String(fileError);
+        task.logs.push(
+          `[${new Date().toISOString()}] Failed to save task output to ${task.config.outputFile}. Error: ${fileErrorMessage}`,
+        );
+        console.warn(
+          `Failed to save task output for "${task.config.description}" (ID: ${task.id}) to ${task.config.outputFile}. Error: ${fileErrorMessage}`,
+        );
+      }
+    }
+
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e));
     task.status = 'failed';
     task.error = error.message;
-    task.output = null;
-    task.parsedOutput = null;
-    task.validationError = null;
+    task.output = null; // Ensure output is nulled on failure
+    task.parsedOutput = null; // Ensure parsedOutput is nulled
+    task.validationError = null; // Ensure validationError is nulled
     task.completedAt = new Date();
     const endTime = task.completedAt.toISOString();
     task.logs.push(`[${endTime}] Task failed. Error: ${error.message}`);
     console.error(
       `Task '${task.config.description}' (ID: ${task.id}) failed execution by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Error: ${task.error}`,
     );
-    throw error;
+    throw error; // Re-throw the error so the crew can handle it
   }
 }
 
-// Helper functions to check task status (Restored)
+// Helper functions to check task status
 export function isTaskCompleted(task: Task): boolean {
   return task.status === 'completed';
 }

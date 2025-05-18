@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, type MockedFunction } from 'vitest';
+import { describe, it, expect, vi, beforeEach, type MockedFunction, type Mock } from 'vitest';
 import {
   createTask,
   executeTask,
@@ -14,6 +14,8 @@ import {
   performAgentTask, // We will mock this
 } from '../agents';
 import { z } from 'zod'; // Import Zod
+import * as fs from 'node:fs'; // Import fs for mocking
+import * as path from 'node:path'; // Import path for mocking (though less direct mocking needed)
 
 // Mock performAgentTask from src/agents
 vi.mock('../agents', async (importOriginal) => {
@@ -28,6 +30,9 @@ vi.mock('../agents', async (importOriginal) => {
 const mockedPerformAgentTask = performAgentTask as MockedFunction<
   (agent: Agent, taskDescription: string, context?: string | undefined) => Promise<unknown>
 >;
+
+// Mock fs module
+vi.mock('node:fs');
 
 describe('Task System', () => {
   let testAgent: Agent;
@@ -285,6 +290,148 @@ describe('Task System', () => {
       expect(task.output).toBeNull();
       expect(task.parsedOutput).toBeNull();
       expect(task.validationError).toBeNull();
+    });
+  });
+
+  describe('executeTask - outputFile functionality', () => {
+    const mockOutputDir = './test_outputs';
+    const baseOutputFilePath = `${mockOutputDir}/output.json`;
+
+    beforeEach(() => {
+      // Reset mocks for fs before each test in this block
+      vi.resetAllMocks(); // This will also reset performAgentTask, so re-mock it if general tests need it.
+                          // For this specific block, we might re-mock performAgentTask for clarity.
+
+      // Default mock implementation for performAgentTask needed again due to vi.resetAllMocks()
+      mockedPerformAgentTask.mockImplementation(async (agent, taskDescription) => {
+        return `Mocked LLM response for: ${taskDescription} by ${agent.config.role}`;
+      });
+
+      // Setup fs mocks
+      (fs.writeFileSync as Mock).mockClear();
+      (fs.existsSync as Mock).mockClear().mockReturnValue(true); // Assume dir exists by default
+      (fs.mkdirSync as Mock).mockClear();
+    });
+
+    it('should write parsedOutput to outputFile if schema matches and outputFile is set', async () => {
+      const schema = z.object({ data: z.string(), count: z.number() });
+      const taskConfig: TaskConfig = {
+        description: 'Save parsed output',
+        expectedOutput: 'Parsed data saved',
+        outputSchema: schema,
+        outputFile: baseOutputFilePath,
+      };
+      const task = createTask(taskConfig);
+      const mockLLMOutput = { data: "parsed success", count: 101 };
+      mockedPerformAgentTask.mockResolvedValueOnce(mockLLMOutput);
+
+      await executeTask(task, testAgent);
+
+      expect(fs.writeFileSync).toHaveBeenCalledOnce();
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        path.resolve(baseOutputFilePath),
+        JSON.stringify(mockLLMOutput, null, 2)
+      );
+      expect(task.logs.some(log => log.includes(`Task output saved to ${path.resolve(baseOutputFilePath)}`))).toBe(true);
+    });
+
+    it('should write raw output to outputFile if schema mismatches and outputFile is set', async () => {
+      const schema = z.object({ message: z.string() });
+      const taskConfig: TaskConfig = {
+        description: 'Save raw output on schema mismatch',
+        expectedOutput: 'Raw data saved',
+        outputSchema: schema,
+        outputFile: baseOutputFilePath,
+      };
+      const task = createTask(taskConfig);
+      const mockLLMOutput = { unexpected: "mismatch data", value: 999 }; // Mismatched output
+      mockedPerformAgentTask.mockResolvedValueOnce(mockLLMOutput);
+
+      await executeTask(task, testAgent);
+
+      expect(fs.writeFileSync).toHaveBeenCalledOnce();
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        path.resolve(baseOutputFilePath),
+        JSON.stringify(mockLLMOutput, null, 2) // Should save the raw output
+      );
+      expect(task.logs.some(log => log.includes(`Task output saved to ${path.resolve(baseOutputFilePath)}`))).toBe(true);
+    });
+
+    it('should write raw output to outputFile if no schema is provided and outputFile is set', async () => {
+      const taskConfig: TaskConfig = {
+        description: 'Save raw output no schema',
+        expectedOutput: 'Raw data saved',
+        outputFile: baseOutputFilePath,
+      };
+      const task = createTask(taskConfig);
+      const mockLLMOutput = "Simple string output for file";
+      mockedPerformAgentTask.mockResolvedValueOnce(mockLLMOutput);
+
+      await executeTask(task, testAgent);
+
+      expect(fs.writeFileSync).toHaveBeenCalledOnce();
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        path.resolve(baseOutputFilePath),
+        JSON.stringify(mockLLMOutput, null, 2)
+      );
+    });
+
+    it('should not write to file if outputFile is not set', async () => {
+      const taskConfig: TaskConfig = {
+        description: 'No file output',
+        expectedOutput: 'Just console',
+        // No outputFile
+      };
+      const task = createTask(taskConfig);
+      mockedPerformAgentTask.mockResolvedValueOnce("Some output");
+
+      await executeTask(task, testAgent);
+
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    });
+
+    it('should create directory if it does not exist', async () => {
+      (fs.existsSync as Mock).mockReturnValue(false); // Simulate directory does not exist
+      const taskConfig: TaskConfig = {
+        description: 'Create dir then save',
+        expectedOutput: 'Saved after dir creation',
+        outputFile: baseOutputFilePath,
+      };
+      const task = createTask(taskConfig);
+      mockedPerformAgentTask.mockResolvedValueOnce("data to save");
+
+      await executeTask(task, testAgent);
+
+      expect(fs.mkdirSync).toHaveBeenCalledOnce();
+      expect(fs.mkdirSync).toHaveBeenCalledWith(path.dirname(path.resolve(baseOutputFilePath)), { recursive: true });
+      expect(fs.writeFileSync).toHaveBeenCalledOnce(); // Still should write the file
+    });
+
+    it('should log warning and not fail task if file writing fails', async () => {
+      const fileErrorMessage = "Disk full simulation";
+      (fs.writeFileSync as Mock).mockImplementation(() => {
+        throw new Error(fileErrorMessage);
+      });
+      const taskConfig: TaskConfig = {
+        description: 'File write failure test',
+        expectedOutput: 'Task completes, file fails',
+        outputFile: baseOutputFilePath,
+      };
+      const task = createTask(taskConfig);
+      mockedPerformAgentTask.mockResolvedValueOnce("some crucial output");
+
+      // Spy on console.warn for this test
+      const consoleWarnSpy = vi.spyOn(console, 'warn');
+
+      await executeTask(task, testAgent);
+
+      expect(task.status).toBe('completed'); // Task itself should complete
+      expect(task.output).toBe("some crucial output");
+      expect(task.logs.some(log => log.includes(`Failed to save task output to ${baseOutputFilePath}. Error: ${fileErrorMessage}`))).toBe(true);
+      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining(`Failed to save task output for "${taskConfig.description}"`));
+      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining(fileErrorMessage));
+
+      consoleWarnSpy.mockRestore(); // Clean up spy
     });
   });
 }); 
