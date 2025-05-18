@@ -17,10 +17,9 @@ export interface ToolContext {
 export interface Tool<TInput = unknown, TOutput = unknown> {
   name: string;
   description: string;
-  // biome-ignore lint/suspicious/noExplicitAny: Flexible input for tools
   execute: (input: TInput, context?: ToolContext) => Promise<TOutput>;
   // Optional: Define if the tool's output can be directly used as input for another task/agent
-  // isOutputSharable?: boolean;
+  isDirectInput?: boolean; // e.g. for a simple calculator, the output is directly usable.
   // Optional: A schema for the expected input, could be a JSON schema object or a validation function.
   // inputSchema?: object | ((input: any) => { valid: boolean; message?: string });
 }
@@ -53,9 +52,9 @@ export const simpleCalculatorTool: Tool<string, string> = {
   name: 'SimpleCalculator',
   description:
     'A simple calculator that evaluates mathematical expressions. Input should be a string like "5 + 3" or "10 * 2 / 4".',
-  // biome-ignore lint/security/noGlobalEval: This tool explicitly uses eval for calculations
   async execute(expression: string, _context?: ToolContext): Promise<string> {
     try {
+      // Warning: Using eval can be a security risk if the input is not sanitized.
       // biome-ignore lint/security/noGlobalEval: Core functionality of this specific tool
       const result = eval(expression);
 

@@ -360,18 +360,17 @@ export function createAnthropicChatClient(config: AnthropicConfig): ChatLLM<Anth
 
         const data = await response.json() as AnthropicMessageResponse;
 
-        if (data && data.content && Array.isArray(data.content) && data.content.length > 0 && data.content[0]?.type === 'text') {
+        if (data?.content && Array.isArray(data.content) && data.content.length > 0 && data.content[0]?.type === 'text') {
           return {
             role: 'assistant', // Anthropic responses are always 'assistant' role
             content: data.content[0].text,
           };
-        } else { 
-          throw new AnthropicError(
-            'Anthropic API returned an unexpected response structure. No valid text content found.',
-            response.status,
-            'api_structure_error'
-          );
         }
+        throw new AnthropicError(
+          'Anthropic API returned an unexpected response structure. No valid text content found.',
+          response.status,
+          'api_structure_error'
+        );
       } catch (e) {
         if (e instanceof AnthropicError) {
           throw e;
