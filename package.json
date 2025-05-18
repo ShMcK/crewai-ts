@@ -23,6 +23,10 @@
   ],
   "author": "",
   "license": "MIT",
+  "dependencies": {
+    "uuid": "^11.1.0",
+    "zod": "^3.24.4"
+  },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
     "@types/node": "^22.15.18",
@@ -35,8 +39,5 @@
   "files": [
     "dist"
   ],
-  "packageManager": "pnpm@10.8.0+sha512.0e82714d1b5b43c74610193cb20734897c1d00de89d0e18420aebc5977fa13d780a9cb05734624e81ebd81cc876cd464794850641c48b9544326b5622ca29971",
-  "dependencies": {
-    "uuid": "^11.1.0"
-  }
+  "packageManager": "pnpm@10.8.0+sha512.0e82714d1b5b43c74610193cb20734897c1d00de89d0e18420aebc5977fa13d780a9cb05734624e81ebd81cc876cd464794850641c48b9544326b5622ca29971"
 }

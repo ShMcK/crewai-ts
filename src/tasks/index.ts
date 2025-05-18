@@ -1,6 +1,7 @@
 // Task definitions for crew-ai-ts
 import { type Agent, performAgentTask } from '../agents';
 import { v4 as uuidv4 } from 'uuid';
+import type { z, ZodTypeAny } from 'zod';
 
 // Task Configuration (Input to create a task)
 export interface TaskConfig {
@@ -9,6 +10,7 @@ export interface TaskConfig {
   agent?: Agent; // Agent who is preferred/assigned to perform the task
   context?: string; // Data from other tasks or initial context
   asyncExecution?: boolean; // Hint for the crew on how to run this
+  outputSchema?: ZodTypeAny; // Use ZodTypeAny
   // Example of a potential future config property:
   // toolNames?: string[]; // Specify tools required/allowed for this task
 }
@@ -18,10 +20,14 @@ export interface Task {
   readonly id: string; // Unique identifier for the task instance
   readonly config: TaskConfig; // The original configuration
 
-  status: 'pending' | 'in_progress' | 'completed' | 'failed';
-  output?: string | object; // The result of the task execution
-  error?: string; // Error message if the task failed
+  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'skipped';
+  output: unknown | null; // Use unknown
+  parsedOutput?: unknown | null; // Use unknown
+  validationError?: z.ZodError | null; // For Zod validation errors
+  error: string | object | null; // Error message if the task failed
   logs: string[]; // For capturing execution logs specific to this task run
+  createdAt: Date;
+  updatedAt: Date;
   startedAt?: Date;
   completedAt?: Date;
 }
@@ -32,7 +38,13 @@ export function createTask(config: TaskConfig): Task {
     id: uuidv4(),
     config,
     status: 'pending',
+    output: null, // Initialize output to null
+    parsedOutput: null, // Initialize parsedOutput to null
+    validationError: null, // Initialize validationError to null
+    error: null, // Initialize error to null
     logs: [],
+    createdAt: new Date(),
+    updatedAt: new Date(),
   };
 }
 
@@ -62,30 +74,59 @@ export async function executeTask(
   try {
     const result = await performAgentTask(agentForExecution, task.config.description, task.config.context);
     task.output = result;
+
+    // Perform Zod validation if outputSchema is provided
+    if (task.config.outputSchema) {
+      const parseResult = task.config.outputSchema.safeParse(task.output);
+      if (parseResult.success) {
+        task.parsedOutput = parseResult.data;
+        task.validationError = null;
+        task.logs.push(`[${new Date().toISOString()}] Task output successfully validated against schema.`);
+        if (agentForExecution.config.verbose) {
+          console.log(`Task output for "${task.config.description}" (ID: ${task.id}) successfully validated. Parsed data available.`);
+        }
+      } else {
+        task.parsedOutput = null;
+        task.validationError = parseResult.error;
+        const errorDetail = parseResult.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
+        task.logs.push(`[${new Date().toISOString()}] Task output validation failed: ${errorDetail}`);
+        console.warn(
+          `Task output validation failed for "${task.config.description}" (ID: ${task.id}). Errors: ${errorDetail}. Raw output is still available.`
+        );
+      }
+    } else {
+      task.parsedOutput = null;
+      task.validationError = null;
+    }
+
     task.status = 'completed';
     task.completedAt = new Date();
     const endTime = task.completedAt.toISOString();
     task.logs.push(
-      `[${endTime}] Task completed. Output: ${typeof result === 'string' ? result : JSON.stringify(result)}`,
+      `[${endTime}] Task completed. Output: ${typeof task.output === 'string' ? task.output : JSON.stringify(task.output)}`
     );
     console.log(
-      `Task '${task.config.description}' (ID: ${task.id}) finished by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Output: ${result}`,
+      `Task '${task.config.description}' (ID: ${task.id}) finished by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Output: ${task.output}`,
     );
+
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e));
     task.status = 'failed';
     task.error = error.message;
-    task.completedAt = new Date(); // Mark completion time even on failure
+    task.output = null;
+    task.parsedOutput = null;
+    task.validationError = null;
+    task.completedAt = new Date();
     const endTime = task.completedAt.toISOString();
     task.logs.push(`[${endTime}] Task failed. Error: ${error.message}`);
     console.error(
       `Task '${task.config.description}' (ID: ${task.id}) failed execution by agent ${agentForExecution.config.role} (ID: ${agentForExecution.id}). Error: ${task.error}`,
     );
-    throw error; // Re-throw to allow callers to handle it
+    throw error;
   }
 }
 
-// Helper functions to check task status
+// Helper functions to check task status (Restored)
 export function isTaskCompleted(task: Task): boolean {
   return task.status === 'completed';
 }

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi, type Mock, type MockedFunction } from 'vitest';
 import { CrewProcess } from '../core';
 import { createCrew, runCrew } from './index'; // Assuming named exports
-import type { Crew, CrewConfig } from './index';
+import type { Crew, CrewConfig, TaskOutputDetail } from './index';
 import type { Agent, AgentConfig } from '../agents';
 import { createAgent } from '../agents'; // Assuming factory function
 import type { Task, TaskConfig } from '../tasks';
@@ -9,21 +9,50 @@ import { createTask, executeTask as originalExecuteTask } from '../tasks'; // As
 import type { ChatLLM, OpenAIConfig } from '../llms'; // Import ChatLLM
 import { performAgentTask as originalPerformAgentTask } from '../agents';
 import type { Tool, ToolContext } from '../tools'; // Added ToolContext
+import { z } from 'zod'; // Import Zod for schema definitions in tests
 
 // Mock the executeTask function from src/tasks
 vi.mock('../tasks', async (importOriginal) => {
-  const original = await importOriginal<typeof import('../tasks')>();
+  const originalModule = await importOriginal<typeof import('../tasks')>();
   return {
-    ...original,
-    executeTask: vi.fn().mockImplementation(async (task: Task, _agent: Agent) => {
-      // Simulate task execution: set output and status
-      task.output = `Output from task: ${task.config.description}`;
+    ...originalModule,
+    executeTask: vi.fn().mockImplementation(async (task: Task, agent: Agent) => {
+      // Simulate getting raw output from an agent/LLM first
+      // This part would normally be from performAgentTask, but executeTask calls it.
+      // For crew tests, performAgentTask is often separately mocked for manager, 
+      // but worker agents rely on executeTask's behavior.
+      // Let's assume a simple scenario where the raw output can be predefined or derived for testing.
+      let rawOutput: unknown = `Raw output for ${task.config.description}`;
+      if (task.config.description.includes('structured')) {
+        rawOutput = { data: 'some structured data', value: 123 };
+      }
+      if (task.config.description.includes('mismatched')) {
+        rawOutput = { wrong: 'mismatched data', num: 456 };
+      }
+      if (task.config.description.includes('valid_user')) {
+        rawOutput = { name: 'Test User', age: 30 };
+      }
+       if (task.config.description.includes('invalid_user')) {
+        rawOutput = { name: 'Test User', age: 'thirty' }; // age should be number
+      }
+
+
+      task.output = rawOutput;
+
+      if (task.config.outputSchema) {
+        const parseResult = task.config.outputSchema.safeParse(rawOutput);
+        if (parseResult.success) {
+          task.parsedOutput = parseResult.data;
+          task.validationError = null;
+        } else {
+          task.parsedOutput = null;
+          task.validationError = parseResult.error;
+        }
+      }
       task.status = 'completed';
-      task.logs.push(`Mock execution log for ${task.config.description}`);
+      task.logs.push(`Mock execution log for ${task.config.description}. Parsed: ${!!task.parsedOutput}`);
       task.completedAt = new Date();
     }),
-    // Ensure createTask is still available if not mocked
-    createTask: original.createTask,
   };
 });
 
@@ -88,7 +117,7 @@ describe('Crew', () => {
       id: 'mock-manager-llm',
       providerName: 'mock-provider',
       config: { modelName: 'mock-manager-model' } as OpenAIConfig, // or a generic LLMConfig
-      chat: vi.fn().mockResolvedValue({ role: 'assistant', content: '{"taskIdToDelegate": "task-id", "agentIdToAssign": "agent-id"}' }),
+      chat: vi.fn(), // Default to a plain vi.fn(). Tests MUST provide specific implementations or mockResolvedValue sequences.
       invoke: vi.fn().mockResolvedValue({ role: 'assistant', content: 'mock invoke' }),
     };
 
@@ -96,6 +125,8 @@ describe('Crew', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {}); // Re-enable the spy
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    mockedPerformAgentTask.mockClear(); // Clear this too
   });
 
   describe('createCrew', () => {
@@ -227,12 +258,12 @@ describe('Crew', () => {
       expect(mockedExecuteTask).toHaveBeenCalledWith(task2, mockAgent2);
 
       expect(crew.status).toBe('COMPLETED');
-      expect(crew.output).toBe(`Output from task: ${task2.config.description}`); // Last task output
+      expect(crew.output).toBe(`Raw output for ${task2.config.description}`);
       expect(crew.tasksOutput.get(task1.id)?.output).toBe(
-        `Output from task: ${task1.config.description}`,
+        `Raw output for ${task1.config.description}`
       );
       expect(crew.tasksOutput.get(task2.id)?.output).toBe(
-        `Output from task: ${task2.config.description}`,
+        `Raw output for ${task2.config.description}`
       );
       expect(crew.startedAt).toBeInstanceOf(Date);
       expect(crew.completedAt).toBeInstanceOf(Date);
@@ -251,58 +282,77 @@ describe('Crew', () => {
       expect(crew.status).toBe('COMPLETED');
     });
     
-    it('should execute tasks using hierarchical fallback (sequential) and update crew status', async () => {
+    it('should execute tasks using hierarchical process and update crew status', async () => {
       const task1 = createTask(task1Config); // Agent is mockAgent1
       const task2 = createTask(task2Config); // Agent is mockAgent2
       const crewConfig: CrewConfig = {
         agents: [mockAgent1, mockAgent2],
         tasks: [task1, task2],
-        process: CrewProcess.HIERARCHICAL, // Set to hierarchical
-        verbose: true,
-        managerLlm: mockManagerLlm, // Add mock manager LLM
+        process: CrewProcess.HIERARCHICAL, 
+        verbose: false, 
+        managerLlm: mockManagerLlm, 
       };
       const crew = createCrew(crewConfig);
+      const genericSummary = "Default summary for tests without specific summary content.";
+
+      // Mock sequence for 2 tasks: Delegate T1, Delegate T2, then Summary Call
+      (mockManagerLlm.chat as Mock)
+        .mockReset()
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
+        .mockResolvedValueOnce({ role: 'assistant', content: genericSummary }); // Summary call
 
       await runCrew(crew);
 
-      // expect(mockedExecuteTask).toHaveBeenCalledTimes(2); // This will change with actual hierarchical logic
-      // expect(mockedExecuteTask).toHaveBeenCalledWith(task1, mockAgent1);
-      // expect(mockedExecuteTask).toHaveBeenCalledWith(task2, mockAgent2);
-      // expect(console.log).toHaveBeenCalledWith(expect.stringContaining('[Crew AI] Hierarchical process is not yet implemented'));
-      // For now, since managerLlm.chat is basic, let's check it was called
-      expect(mockManagerLlm.chat).toHaveBeenCalled();
-      expect(crew.status).toBe('COMPLETED'); // Or FAILED if manager decision is bad / no tasks
+      expect(mockedExecuteTask).toHaveBeenCalledTimes(2);
+      expect(mockedExecuteTask).toHaveBeenCalledWith(task1, mockAgent1);
+      expect(mockedExecuteTask).toHaveBeenCalledWith(task2, mockAgent2);
+      
+      expect(mockManagerLlm.chat).toHaveBeenCalledTimes(3); // T1, T2, Summary
+      expect(crew.status).toBe('COMPLETED'); 
+      expect(crew.output).toBe(genericSummary);
     });
 
-    it('should use first crew agent if task has no agent (hierarchical fallback)', async () => {
+    it('should correctly delegate task without pre-assigned agent in hierarchical process', async () => {
       const taskNoAgent = createTask({ description: 'Task with no agent hierarchical', expectedOutput: 'exp' });
       const crewConfig: CrewConfig = {
         agents: [mockAgent1, mockAgent2],
         tasks: [taskNoAgent],
         process: CrewProcess.HIERARCHICAL,
-        managerLlm: mockManagerLlm, // Add mock manager LLM
+        managerLlm: mockManagerLlm, 
+        verbose: false,
       };
       const crew = createCrew(crewConfig);
+      const genericSummary = "Default summary for single task test.";
+
+      // Mock sequence for 1 task: Delegate Task, then Summary Call
+      (mockManagerLlm.chat as Mock)
+        .mockReset()
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: taskNoAgent.id, agentIdToAssign: mockAgent1.id }) }) // Manager chooses mockAgent1
+        .mockResolvedValueOnce({ role: 'assistant', content: genericSummary }); // Summary call
+      
       await runCrew(crew);
-      // In hierarchical, agent assignment is up to the manager, not a fallback to the first agent.
-      // The mock for executeTask will be called based on manager's decision.
-      // This test might need rethinking for true hierarchical behavior or be removed if covered by manager logic tests.
-      expect(mockManagerLlm.chat).toHaveBeenCalled(); // Manager should have been called
-      // We can't easily assert which agent was used without a more complex mock manager or inspecting manager prompt.
-      // For now, just ensure it completed.
+      
+      expect(mockManagerLlm.chat).toHaveBeenCalledTimes(2); // Delegate, Summary
+      expect(mockedExecuteTask).toHaveBeenCalledTimes(1);
+      expect(mockedExecuteTask).toHaveBeenCalledWith(taskNoAgent, mockAgent1); 
       expect(crew.status).toBe('COMPLETED');
+      expect(crew.output).toBe(genericSummary);
     });
 
     it('should handle task execution failure and set crew status to FAILED', async () => {
       mockedExecuteTask.mockImplementationOnce(async (task: Task) => {
-         task.output = `Output from task: ${task.config.description}`;
+         task.output = `Raw output for ${task.config.description}`;
          task.status = 'completed';
+         task.completedAt = new Date();
+         if (task.config.outputSchema) { /* basic Zod handling if needed, or assume no schema */ }
       });
       mockedExecuteTask.mockImplementationOnce(async (task: Task) => {
         task.status = 'failed';
         task.error = 'Simulated task error';
         task.completedAt = new Date();
-        throw new Error('Simulated task error');
+        task.logs.push('Simulated failure log');
+        throw new Error('Simulated task error'); // This error is caught by runCrew
       });
 
       const task1 = createTask(task1Config);
@@ -316,7 +366,9 @@ describe('Crew', () => {
       await runCrew(crew);
 
       expect(crew.status).toBe('FAILED');
-      expect(crew.output).toEqual({ error: 'Simulated task error' });
+      expect(crew.output).toEqual({ 
+        error: `Critical error during sequential execution of task ${task2.id}: Simulated task error` 
+      });
       expect(console.error).toHaveBeenCalledWith(expect.stringContaining(`Crew ${crew.id} failed:`), expect.any(Error));
       expect(crew.completedAt).toBeInstanceOf(Date);
     });
@@ -373,13 +425,13 @@ describe('Crew', () => {
         expect.stringContaining(`Executing task: ${task1.config.description}`)
       );
       expect(console.log).toHaveBeenCalledWith(
-        expect.stringContaining(`Task Output (ID: ${task1.id}): Output from task: ${task1.config.description}`)
+        expect.stringContaining(`Task Output (ID: ${task1.id}): Raw output for ${task1.config.description}`)
       );
       expect(console.log).toHaveBeenCalledWith(
         expect.stringContaining('[Crew AI] Crew Execution Complete.')
       );
       expect(console.log).toHaveBeenCalledWith(
-        expect.stringContaining(`Final Output: "Output from task: ${task1.config.description}"`)
+        expect.stringContaining(`Final Output: "Raw output for ${task1.config.description}"`)
       );
       // Ensure it was called a specific number of times if the logs are predictable
       // For example, for a single task sequential crew:
@@ -408,42 +460,9 @@ describe('Crew', () => {
         task1 = createTask(task1Config); // agent mockAgent1
         task2 = createTask(task2Config); // agent mockAgent2
 
-        // Reset and configure mocks for multi-stage hierarchical process
-        // 1. Delegate task1, 2. Delegate task2, 3. All tasks completed, 4. Generate summary
-        mockManagerLlm.chat = vi.fn()
-          .mockReset()
-          .mockName("RawLLM_Delegation_T1")
-          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
-          .mockName("RawLLM_Delegation_T2")
-          .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
-          .mockName("RawLLM_Final_Summary")
-          .mockResolvedValueOnce({ role: 'assistant', content: finalSummaryResponse });
-
-        mockedPerformAgentTask.mockImplementation(async (agent, taskDescOrAction, context) => {
-          // Manager agent making a delegation decision
-          if (taskDescOrAction.includes("Delegate a task") || taskDescOrAction.includes("As the project manager")) {
-            // Simplified logic: count calls to determine which task to delegate or if all done for delegation phase.
-            const delegationCalls = mockedPerformAgentTask.mock.calls.filter(call => 
-                (call[1].includes("Delegate a task") || call[1].includes("As the project manager")) &&
-                !call[1].includes("overall crew objective") // Exclude final summary calls
-            );
-
-            if (delegationCalls.length <= 1) { // First actual delegation call by manager
-                return JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id, additionalContextForAgent: "Manager agent context for task 1" });
-            }
-            if (delegationCalls.length === 2) { // Second actual delegation call by manager
-                 return JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id, additionalContextForAgent: "Manager agent context for task 2" });
-            }
-            // After two delegations, manager should signal completion of delegation phase
-            return "ALL_TASKS_COMPLETED"; 
-          }
-          // Manager agent generating the final summary
-          if (taskDescOrAction.includes("overall crew objective") && taskDescOrAction.includes("provide a comprehensive final summary")) {
-            return `Manager agent summary: ${finalSummaryResponse} based on context: ${context?.substring(0, 50)}...`;
-          }
-          // Fallback for other agent tasks (e.g., worker agents, though their execution is mocked by mockedExecuteTask)
-          return `Agent ${agent.config.role} processed: ${taskDescOrAction.substring(0,30)}`;
-        });
+        // Reset mocks for this specific suite. Tests will set their own sequences.
+        (mockManagerLlm.chat as Mock).mockReset();
+        (mockedPerformAgentTask as Mock).mockReset();
       });
 
       it('should use custom objective in raw LLM manager final summary prompt', async () => {
@@ -453,22 +472,16 @@ describe('Crew', () => {
           process: CrewProcess.HIERARCHICAL,
           managerLlm: mockManagerLlm,
           objective: customObjective,
-          verbose: false, // Keep verbose false to simplify mock verification
+          verbose: false, 
         };
         const crew = createCrew(crewConfig);
 
-        // Refine mockManagerLlm.chat for this specific test flow
-        // Iteration 1: Delegate task1
-        // Iteration 2: Delegate task2
-        // Iteration 3: Manager says ALL_TASKS_COMPLETED
-        // Call for Final Summary
         (mockManagerLlm.chat as Mock)
-          .mockReset()
-          .mockName("RawLLM_Delegation_T1")
+          .mockName("RawLLM_Delegation_T1_CustomObj")
           .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
-          .mockName("RawLLM_Delegation_T2")
+          .mockName("RawLLM_Delegation_T2_CustomObj")
           .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
-          .mockName("RawLLM_Final_Summary")
+          .mockName("RawLLM_Final_Summary_CustomObj")
           .mockResolvedValueOnce({ role: 'assistant', content: finalSummaryResponse });
 
         await runCrew(crew);
@@ -486,7 +499,7 @@ describe('Crew', () => {
         expect(summaryPrompt).toContain(customObjective);
         expect(summaryPrompt).not.toContain(defaultObjective);
         expect(summaryPrompt).toContain(task1.config.description); // Check task outputs are in summary context
-        expect(summaryPrompt).toContain(`Output from task: ${task1.config.description}`);
+        expect(summaryPrompt).toContain(`Raw output for ${task1.config.description}`);
       });
 
       it('should use default objective in raw LLM manager final summary if none provided', async () => {
@@ -495,17 +508,15 @@ describe('Crew', () => {
           tasks: [task1, task2],
           process: CrewProcess.HIERARCHICAL,
           managerLlm: mockManagerLlm,
-          // No objective
           verbose: false,
         };
         const crew = createCrew(crewConfig);
         (mockManagerLlm.chat as Mock)
-          .mockReset()
-          .mockName("RawLLM_Delegation_T1")
+          .mockName("RawLLM_Delegation_T1_DefaultObj")
           .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }) })
-          .mockName("RawLLM_Delegation_T2")
+          .mockName("RawLLM_Delegation_T2_DefaultObj")
           .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }) })
-          .mockName("RawLLM_Final_Summary")
+          .mockName("RawLLM_Final_Summary_DefaultObj")
           .mockResolvedValueOnce({ role: 'assistant', content: finalSummaryResponse });
 
         await runCrew(crew);
@@ -533,19 +544,13 @@ describe('Crew', () => {
         };
         const crew = createCrew(crewConfig);
 
-        // Configure mockedPerformAgentTask for this test's flow:
-        // 1. Manager Agent delegates task1
-        // 2. Manager Agent delegates task2
-        // 3. Manager Agent says "ALL_TASKS_COMPLETED" (or implies it by not delegating further)
-        // 4. Manager Agent generates final summary
         const managerSummaryOutput = `Manager agent summary: ${finalSummaryResponse} with custom objective`;
         (mockedPerformAgentTask as Mock)
-            .mockReset()
-            .mockName("ManagerAgent_Delegation_Call_1")
+            .mockName("ManagerAgent_Delegation_T1_CustomObj")
             .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }))
-            .mockName("ManagerAgent_Delegation_Call_2")
+            .mockName("ManagerAgent_Delegation_T2_CustomObj")
             .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }))
-            .mockName("ManagerAgent_Final_Summary_Call_3")
+            .mockName("ManagerAgent_Final_Summary_CustomObj")
             .mockResolvedValueOnce(managerSummaryOutput);
 
         await runCrew(crew);
@@ -564,7 +569,7 @@ describe('Crew', () => {
         // Check that the context passed to manager for summary includes task outputs
         const managerAgentSummaryContext = summaryCall?.[2]; // Third argument is context
         expect(managerAgentSummaryContext).toContain(task1.config.description);
-        expect(managerAgentSummaryContext).toContain(`Output from task: ${task1.config.description}`);
+        expect(managerAgentSummaryContext).toContain(`Raw output for ${task1.config.description}`);
       });
 
       it('should use default objective in Manager Agent final summary task if none provided', async () => {
@@ -588,12 +593,11 @@ describe('Crew', () => {
             const managerSummaryOutputDef = `Manager agent summary: ${finalSummaryResponse} with default objective`;
             
             (mockedPerformAgentTask as Mock)
-                .mockReset()
-                .mockName("ManagerAgent_Delegation_Call_1")
+                .mockName("ManagerAgent_Delegation_T1_DefaultObj")
                 .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task1.id, agentIdToAssign: mockAgent1.id }))
-                .mockName("ManagerAgent_Delegation_Call_2")
+                .mockName("ManagerAgent_Delegation_T2_DefaultObj")
                 .mockResolvedValueOnce(JSON.stringify({ taskIdToDelegate: task2.id, agentIdToAssign: mockAgent2.id }))
-                .mockName("ManagerAgent_Final_Summary_Call_3")
+                .mockName("ManagerAgent_Final_Summary_DefaultObj")
                 .mockResolvedValueOnce(managerSummaryOutputDef);
     
             await runCrew(crew);
@@ -611,6 +615,188 @@ describe('Crew', () => {
             console.error = originalConsoleError; 
         }
       });
+    });
+  });
+
+  describe('runCrew - with Task Output Parsing', () => {
+    let userSchema: z.ZodObject<{ name: z.ZodString; age: z.ZodNumber }>;
+    let taskWithSchema: Task;
+    let taskWithBadData: Task;
+    let taskValidForMixed: Task;
+    let taskInvalidForMixed: Task;
+    let taskNoSchemaForMixed: Task;
+
+    beforeEach(() => {
+      userSchema = z.object({
+        name: z.string(),
+        age: z.number(),
+      });
+
+      // These tasks are created fresh for each test in this suite
+      // Descriptions are key for the executeTask mock
+      taskWithSchema = createTask({
+        description: 'Process valid_user data', // executeTask mock looks for 'valid_user'
+        expectedOutput: 'User processed',
+        outputSchema: userSchema,
+        agent: mockAgent1,
+      });
+      taskWithBadData = createTask({
+        description: 'Process invalid_user data', // executeTask mock looks for 'invalid_user'
+        expectedOutput: 'User processed with issues',
+        outputSchema: userSchema,
+        agent: mockAgent1,
+      });
+      taskValidForMixed = createTask({
+        description: 'Process valid_user data for mixed', // Re-use 'valid_user' for simplicity
+        expectedOutput: 'Valid mixed output',
+        outputSchema: userSchema,
+        agent: mockAgent1,
+      });
+      taskInvalidForMixed = createTask({
+        description: 'Process invalid_user data for mixed', // Re-use 'invalid_user'
+        expectedOutput: 'Invalid mixed output',
+        outputSchema: userSchema,
+        agent: mockAgent1,
+      });
+      taskNoSchemaForMixed = createTask({
+        description: 'Process raw data for mixed', // Generic, no special handling in executeTask mock beyond default
+        expectedOutput: 'Raw mixed output',
+        agent: mockAgent2,
+      });
+
+      // Default for manager agent summarization if used by a test (though these tests use raw LLM manager)
+      mockedPerformAgentTask.mockImplementation(async (agent, taskDescOrAction) => {
+        if (taskDescOrAction.includes('overall crew objective')) {
+          return 'Manager Agent summarized the outputs.';
+        }
+        // Default for manager delegation if needed (should not be for these specific tests if mockManagerLlm.chat is well-defined)
+        return JSON.stringify({ taskIdToDelegate: 'fallback-task-id', agentIdToAssign: 'fallback-agent-id' });
+      });
+    });
+
+    it('should store parsedOutput in tasksOutput and use it in manager summary', async () => {
+      const crewConfig: CrewConfig = {
+        agents: [mockAgent1],
+        tasks: [taskWithSchema], 
+        process: CrewProcess.HIERARCHICAL,
+        managerLlm: mockManagerLlm,
+        verbose: false,
+      };
+      // Specific mockManagerLlm.chat for THIS TEST (1 task)
+      (mockManagerLlm.chat as Mock)
+        .mockReset()
+        .mockName("Zod_Test1_Delegate")
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: taskWithSchema.id, agentIdToAssign: mockAgent1.id }) })
+        .mockName("Zod_Test1_Summary")
+        .mockResolvedValueOnce({ role: 'assistant', content: 'Manager summarized [valid user data].' });
+
+      const crew = createCrew(crewConfig);
+      await runCrew(crew);
+
+      expect(crew.status).toBe('COMPLETED');
+      const taskOutputDetail = crew.tasksOutput.get(taskWithSchema.id);
+      expect(taskOutputDetail).toBeDefined();
+      if (taskOutputDetail) {
+        expect(taskOutputDetail.output).toEqual({ name: 'Test User', age: 30 });
+        expect(taskOutputDetail.parsedOutput).toEqual({ name: 'Test User', age: 30 });
+        expect(taskOutputDetail.validationError).toBeNull();
+      }
+      const managerChatCalls = (mockManagerLlm.chat as Mock).mock.calls;
+      const summaryPromptCall = managerChatCalls.find(call => call[0][0].content.includes('Summary of Successfully Completed Task Outputs'));
+      expect(summaryPromptCall).toBeDefined();
+      if (summaryPromptCall) {
+        const summaryPromptContent = summaryPromptCall[0][0].content;
+        expect(summaryPromptContent).toContain(JSON.stringify({ name: 'Test User', age: 30 }));
+        expect(summaryPromptContent).not.toContain('Validation Status: FAILED');
+      }
+      expect(crew.output).toBe('Manager summarized [valid user data].');
+    });
+
+    it('should store validationError and use raw output in manager summary if parsing fails', async () => {
+      const crewConfig: CrewConfig = {
+        agents: [mockAgent1],
+        tasks: [taskWithBadData], 
+        process: CrewProcess.HIERARCHICAL,
+        managerLlm: mockManagerLlm,
+        verbose: false,
+      };
+      // Specific mockManagerLlm.chat for THIS TEST (1 task)
+      (mockManagerLlm.chat as Mock)
+        .mockReset()
+        .mockName("Zod_Test2_Delegate")
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: taskWithBadData.id, agentIdToAssign: mockAgent1.id }) })
+        .mockName("Zod_Test2_Summary")
+        .mockResolvedValueOnce({ role: 'assistant', content: 'Manager summarized [invalid user data].' });
+
+      const crew = createCrew(crewConfig);
+      await runCrew(crew);
+
+      expect(crew.status).toBe('COMPLETED');
+      const taskOutputDetail = crew.tasksOutput.get(taskWithBadData.id);
+      expect(taskOutputDetail).toBeDefined();
+      if (taskOutputDetail) {
+        expect(taskOutputDetail.output).toEqual({ name: 'Test User', age: 'thirty' });
+        expect(taskOutputDetail.parsedOutput).toBeNull();
+        expect(taskOutputDetail.validationError).toBeInstanceOf(z.ZodError);
+      }
+      const managerChatCalls = (mockManagerLlm.chat as Mock).mock.calls;
+      const summaryPromptCall = managerChatCalls.find(call => call[0][0].content.includes('Summary of Successfully Completed Task Outputs'));
+      expect(summaryPromptCall).toBeDefined();
+      if (summaryPromptCall) {
+        const summaryPromptContent = summaryPromptCall[0][0].content;
+        expect(summaryPromptContent).toContain(JSON.stringify({ name: 'Test User', age: 'thirty' }));
+        expect(summaryPromptContent).toContain('Validation Status: FAILED');
+        expect(summaryPromptContent).toContain('age: Expected number, received string');
+      }
+      expect(crew.output).toBe('Manager summarized [invalid user data].');
+    });
+
+    it('should handle mixed tasks (parsed, raw, failed validation) in manager summary', async () => {
+      const crewConfig: CrewConfig = {
+        agents: [mockAgent1, mockAgent2],
+        tasks: [taskValidForMixed, taskInvalidForMixed, taskNoSchemaForMixed], 
+        process: CrewProcess.HIERARCHICAL,
+        managerLlm: mockManagerLlm,
+      };
+       // Specific mockManagerLlm.chat for THIS TEST (3 tasks)
+      (mockManagerLlm.chat as Mock)
+        .mockReset()
+        .mockName("Zod_Test3_Delegate1")
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: taskValidForMixed.id, agentIdToAssign: mockAgent1.id }) })
+        .mockName("Zod_Test3_Delegate2")
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: taskInvalidForMixed.id, agentIdToAssign: mockAgent1.id }) })
+        .mockName("Zod_Test3_Delegate3")
+        .mockResolvedValueOnce({ role: 'assistant', content: JSON.stringify({ taskIdToDelegate: taskNoSchemaForMixed.id, agentIdToAssign: mockAgent2.id }) })
+        .mockName("Zod_Test3_Summary")
+        .mockResolvedValueOnce({ role: 'assistant', content: 'Manager summarized all mixed outputs.' });
+
+      const crew = createCrew(crewConfig);
+      await runCrew(crew);
+
+      expect(crew.status).toBe('COMPLETED');
+      const validDetail = crew.tasksOutput.get(taskValidForMixed.id);
+      const invalidDetail = crew.tasksOutput.get(taskInvalidForMixed.id);
+      const rawDetail = crew.tasksOutput.get(taskNoSchemaForMixed.id);
+
+      expect(validDetail?.parsedOutput).toEqual({ name: 'Test User', age: 30 });
+      expect(invalidDetail?.validationError).toBeInstanceOf(z.ZodError);
+      // The executeTask mock sets parsedOutput to null if no schema or if schema fails.
+      // If no schema, rawOutput is `Raw output for ${description}`, parsedOutput is null.
+      expect(rawDetail?.parsedOutput).toBeNull(); 
+      expect(rawDetail?.output).toBe(`Raw output for ${taskNoSchemaForMixed.config.description}`);
+
+      const managerChatCalls = (mockManagerLlm.chat as Mock).mock.calls;
+      const summaryPromptCall = managerChatCalls.find(call => call[0][0].content.includes('Summary of Successfully Completed Task Outputs'));
+      expect(summaryPromptCall).toBeDefined();
+      if (summaryPromptCall) {
+        const summaryPromptContent = summaryPromptCall[0][0].content;
+        expect(summaryPromptContent).toContain(JSON.stringify({ name: 'Test User', age: 30 }));
+        expect(summaryPromptContent).toContain(JSON.stringify({ name: 'Test User', age: 'thirty' }));
+        expect(summaryPromptContent).toContain('Validation Status: FAILED');
+        expect(summaryPromptContent).toContain(`Raw output for ${taskNoSchemaForMixed.config.description}`);
+        expect(summaryPromptContent.match(/Validation Status: FAILED/g)?.length).toBe(1);
+      }
+      expect(crew.output).toBe('Manager summarized all mixed outputs.');
     });
   });
 }); 

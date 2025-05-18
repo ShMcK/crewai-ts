@@ -1,6 +1,6 @@
 // Crew definitions for crew-ai-ts
-import type { Agent } from '../agents';
-import type { Task } from '../tasks';
+import type { Agent, AgentConfig } from '../agents';
+import type { Task, TaskConfig } from '../tasks';
 import { CrewProcess } from '../core';
 import { v4 as uuidv4 } from 'uuid';
 import { executeTask } from '../tasks';
@@ -11,6 +11,7 @@ import {
   type ChatMessage,
 } from '../llms'; // Import necessary LLM types and factory
 import { performAgentTask } from '../agents';
+import type { z } from 'zod'; // Add Zod import
 
 // biome-ignore lint/suspicious/noExplicitAny: <explanation>
 type Output = any; // Placeholder
@@ -25,19 +26,27 @@ export interface CrewConfig {
   shareCrew?: boolean;
 }
 
+export interface TaskOutputDetail {
+  output: unknown;
+  parsedOutput?: unknown;
+  validationError?: z.ZodError | null;
+  error?: string | object | null;
+  logs: string[];
+}
+
 export interface Crew {
   id: string;
-  config: CrewConfig; // Holds the original config
-  managerLlmInstance?: ChatLLM; // Instantiated manager LLM (if not an Agent)
-  managerAgentInstance?: Agent; // Instantiated manager Agent
+  config: CrewConfig;
   status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
-  // biome-ignore lint/suspicious/noExplicitAny: <explanation>
-  output: any;
-  tasksOutput: Map<string, { output: string | object; logs?: string[] }>;
+  output: unknown | null; // Changed to unknown | null
+  tasksOutput: Map<string, TaskOutputDetail>; // Use the new interface
+  managerLlmInstance?: ChatLLM;
+  managerAgentInstance?: Agent;
   createdAt: Date;
   updatedAt: Date;
   startedAt?: Date;
   completedAt?: Date;
+  telemetryEnabled?: boolean; // Assuming this might be added later for telemetry
 }
 
 interface ManagerDecision {
@@ -144,15 +153,18 @@ export function createCrew(config: CrewConfig): Crew {
 
   return {
     id: uuidv4(),
-    config, // Store the original config
-    managerLlmInstance: instantiatedManagerLlm,
-    managerAgentInstance: instantiatedManagerAgent,
+    config: {
+      ...config,
+      process: config.process || CrewProcess.SEQUENTIAL,
+      verbose: config.verbose === undefined ? false : config.verbose,
+    },
     status: 'PENDING',
-    output: null,
-    tasksOutput: new Map(),
+    output: null, // Initialize output to null
+    tasksOutput: new Map<string, TaskOutputDetail>(),
     createdAt: new Date(),
     updatedAt: new Date(),
-    // process is part of config, no need to duplicate it here at top level of Crew object
+    managerLlmInstance: instantiatedManagerLlm,
+    managerAgentInstance: instantiatedManagerAgent,
   };
 }
 
@@ -181,8 +193,8 @@ export async function runCrew(crew: Crew): Promise<void> {
   crew.updatedAt = new Date();
   sendTelemetry('crew_started', { crew_id: crew.id, process: crew.config.process });
 
-  let finalOutput: Output = null;
-  const taskOutputs = new Map<string, { output: string | object; logs?: string[] }>();
+  let finalOutput: unknown | null = null;
+  const taskOutputs = new Map<string, TaskOutputDetail>();
   const currentProcess = crew.config.process ?? CrewProcess.SEQUENTIAL;
 
   if (crew.config.verbose) {
@@ -228,16 +240,42 @@ ${crew.config.tasks.map((task) => `  - ${task.config.description} (ID: ${task.id
             `\nExecuting task: ${task.config.description} (ID: ${task.id}) with agent: ${agentForExecution.config.role} (ID: ${agentForExecution.id})`,
           );
         }
-        await executeTask(task, agentForExecution);
-        if (task.output !== undefined && task.output !== null) {
-          taskOutputs.set(task.id, { output: task.output, logs: task.logs });
-          finalOutput = task.output;
-        } else if (task.error) {
-          throw new Error(`Task ${task.id} ("${task.config.description}") failed: ${task.error}`);
-        }
-        if (crew.config.verbose) {
-          const outputToLog = typeof task.output === 'string' ? task.output : JSON.stringify(task.output);
-          console.log(`\nTask Output (ID: ${task.id}): ${outputToLog}\n`);
+        try {
+          await executeTask(task, agentForExecution);
+          if (task.status === 'completed') {
+            const taskDetail: TaskOutputDetail = {
+              output: task.output,
+              parsedOutput: task.parsedOutput,
+              validationError: task.validationError,
+              logs: task.logs
+            };
+            taskOutputs.set(task.id, taskDetail);
+            finalOutput = task.parsedOutput !== null && task.parsedOutput !== undefined ? task.parsedOutput : task.output;
+          } else if (task.status === 'failed') {
+            const taskDetail: TaskOutputDetail = {
+              output: task.output,
+              parsedOutput: task.parsedOutput,
+              validationError: task.validationError,
+              error: task.error,
+              logs: task.logs
+            };
+            taskOutputs.set(task.id, taskDetail);
+            finalOutput = { error: `Task ${task.id} failed`, details: task.error };
+            throw new Error(`Task ${task.id} ("${task.config.description}") failed: ${JSON.stringify(task.error)}`);
+          }
+          if (crew.config.verbose) {
+            const outputToLog = typeof task.output === 'string' ? task.output : JSON.stringify(task.output);
+            console.log(`\nTask Output (ID: ${task.id}): ${outputToLog}\n`);
+          }
+        } catch (e: unknown) {
+          const errMessage = e instanceof Error ? e.message : String(e);
+          finalOutput = { error: `Critical error during sequential execution of task ${task.id}`, details: errMessage };
+          taskOutputs.set(task.id, {
+            output: null,
+            error: { critical: errMessage }, 
+            logs: [...task.logs, `Critical error: ${errMessage}`]
+          });
+          throw new Error(`Critical error during sequential execution of task ${task.id}: ${errMessage}`);
         }
       }
     } else if (currentProcess === CrewProcess.HIERARCHICAL) {
@@ -445,13 +483,19 @@ ${managerDecisionText}
           // Potentially ask manager to reconsider or throw error
           // For now, we'll log and let the manager try again in the next iteration.
           // To avoid an immediate loop if the manager is stuck, we could add a specific error message to taskOutputs for this iteration.
-          taskOutputs.set(`manager_error_iteration_${iterationCount}`, { output: { error: `Manager designated task ID ${taskIdToDelegate} not found or not actionable.` } });
+          taskOutputs.set(`manager_error_iteration_${iterationCount}`, {
+            output: { error: `Manager designated task ID ${taskIdToDelegate} not found or not actionable.` },
+            logs: []
+          });
           // No break, let manager retry. If LLM is bad, maxIterations will catch it.
           continue; 
         }
         if (!agentForExecution) {
           console.error(`Manager designated agent ID ${agentIdToAssign} not found.`);
-          taskOutputs.set(`manager_error_iteration_${iterationCount}`, { output: { error: `Manager designated agent ID ${agentIdToAssign} not found.` } });
+          taskOutputs.set(`manager_error_iteration_${iterationCount}`, {
+            output: { error: `Manager designated agent ID ${agentIdToAssign} not found.` }, 
+            logs: []
+          });
           // No break, let manager retry.
           continue;
         }
@@ -471,25 +515,42 @@ ${managerDecisionText}
 
         await executeTask(taskToExecute, agentForExecution); // This mutates taskToExecute
 
-        if (taskToExecute.output !== undefined && taskToExecute.output !== null) {
-          taskOutputs.set(taskToExecute.id, { output: taskToExecute.output, logs: taskToExecute.logs });
-          taskAttemptInfo.set(taskToExecute.id, { status: 'completed', lastAttemptIteration: iterationCount });
-          finalOutput = taskToExecute.output; // Hierarchical output logic might be more complex
+        // Update taskAttemptInfo based on the actual execution status
+        const currentAttemptInfo = taskAttemptInfo.get(taskToExecute.id);
+        if (currentAttemptInfo) {
+            taskAttemptInfo.set(taskToExecute.id, {
+                ...currentAttemptInfo,
+                status: taskToExecute.status === 'completed' ? 'completed' : 'failed',
+                error: taskToExecute.error ? String(taskToExecute.error) : undefined,
+                lastAgentId: agentForExecution.id,
+                lastAttemptIteration: iterationCount,
+            });
+        }
+
+        if (taskToExecute.status === 'completed') {
+          const taskDetail: TaskOutputDetail = {
+            output: taskToExecute.output,
+            parsedOutput: taskToExecute.parsedOutput,
+            validationError: taskToExecute.validationError,
+            logs: taskToExecute.logs
+          };
+          taskOutputs.set(taskToExecute.id, taskDetail);
+          finalOutput = taskToExecute.parsedOutput !== null && taskToExecute.parsedOutput !== undefined ? taskToExecute.parsedOutput : taskToExecute.output;
           if (crew.config.verbose) {
              const outputToLog = typeof taskToExecute.output === 'string' ? taskToExecute.output : JSON.stringify(taskToExecute.output);
              console.log(`\nTask Output (ID: ${taskToExecute.id}): ${outputToLog}\n`);
           }
-        } else if (taskToExecute.error) {
-          // Inform manager about task failure?
-          console.error(`Task ${taskToExecute.id} ("${taskToExecute.config.description}") failed: ${taskToExecute.error}. Agent: ${agentForExecution.id}. Will be available for retry.`);
-          taskOutputs.set(taskToExecute.id, { output: { error: taskToExecute.error, agentId: agentForExecution.id }, logs: taskToExecute.logs });
-          taskAttemptInfo.set(taskToExecute.id, { 
-            status: 'failed', 
-            error: taskToExecute.error, 
-            lastAgentId: agentForExecution.id,
-            lastAttemptIteration: iterationCount 
-          });
-          // Task remains in currentRemainingTasks (implicitly, as it's not 'completed') for the manager to potentially re-assign in the next iteration.
+        } else if (taskToExecute.status === 'failed') {
+          const taskDetail: TaskOutputDetail = {
+            output: taskToExecute.output,
+            parsedOutput: taskToExecute.parsedOutput,
+            validationError: taskToExecute.validationError,
+            error: taskToExecute.error,
+            logs: taskToExecute.logs
+          };
+          taskOutputs.set(taskToExecute.id, taskDetail);
+          // Error already logged by executeTask, manager will decide next step
+          // Potentially set finalOutput here if this is a terminal failure for the loop
         }
 
         // Remove the (just attempted) task from remainingTasks // THIS LOGIC IS NOW HANDLED BY getNonCompletedTasks and taskAttemptInfo
@@ -521,10 +582,29 @@ ${managerDecisionText}
             console.log(`\n[Crew AI] All tasks completed. Requesting final summary from manager ${providerType}...`);
           }
           const successfulTaskOutputsSummary = Array.from(taskOutputs.entries())
-            .filter(([, result]) => !(result.output && typeof result.output === 'object' && 'error' in result.output))
-            .map(([taskId, result]) => {
+            .filter(([, taskDetail]) => {
+              // Filter out tasks that explicitly have an error stored at the TaskOutputDetail level
+              // or whose raw output might look like an error object (though this is less robust).
+              if (taskDetail.error) return false;
+              if (taskDetail.output && typeof taskDetail.output === 'object' && 'error' in taskDetail.output) return false;
+              return true;
+            })
+            .map(([taskId, taskDetail]) => {
               const task = crew.config.tasks.find(t => t.id === taskId);
-              return `Task: ${task?.config.description || taskId}\nOutput: ${typeof result.output === 'string' ? result.output : JSON.stringify(result.output)}`;
+              // Prioritize parsedOutput if available and no validation error, otherwise use raw output.
+              const outputForSummary = (taskDetail.parsedOutput !== null && taskDetail.parsedOutput !== undefined && !taskDetail.validationError)
+                                       ? taskDetail.parsedOutput
+                                       : taskDetail.output;
+              const outputString = typeof outputForSummary === 'string'
+                                   ? outputForSummary
+                                   : JSON.stringify(outputForSummary);
+              
+              let detailString = `Task: ${task?.config.description || taskId}\nOutput: ${outputString}`;
+              if (taskDetail.validationError) {
+                const valErrorSummary = taskDetail.validationError.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
+                detailString += `\nValidation Status: FAILED (Errors: ${valErrorSummary}). Raw output was used for summary.`;
+              }
+              return detailString;
             })
             .join('\n\n');
 
@@ -591,18 +671,24 @@ ${finalOutput}
               if (!summaryMade && (!finalOutput || (typeof finalOutput === 'object' && 'warning' in finalOutput && Object.keys(finalOutput).length === 1))) {
                    finalOutput = "All tasks processed. No summary could be generated due to lack of suitable manager LLM or no successful outputs.";
               }
-            } catch (e) {
+            } catch (e: unknown) {
               console.error('Failed to get final summary from manager:', e);
               // finalOutput would remain as the output of the last task, or the warning if max iterations hit.
               // Add this error to the crew's output.
-               const existingError = (finalOutput && typeof finalOutput === 'object' && finalOutput.error) ? `${finalOutput.error}; ` : '';
-               finalOutput = { 
+               const existingError = (finalOutput && typeof finalOutput === 'object' && 'error' in finalOutput && finalOutput.error) ? `${finalOutput.error}; ` : '';
+               finalOutput = {
                   ...(typeof finalOutput === 'object' ? finalOutput : { previousOutput: finalOutput }),
                   error: `${existingError}Failed to get final summary from manager: ${e instanceof Error ? e.message : String(e)}`
                };
             }
           } else {
-              console.log('\n[Crew AI] Hierarchical process completed, but no manager LLM available for final summary.');
+              console.log('\n[Crew AI] No successfully completed task outputs (without validation errors if schema provided) available to generate a manager summary.');
+              // Consider what finalOutput should be. If it has content from a failed task, that might be it.
+              // If all tasks failed validation or had errors, finalOutput might be an aggregation of those.
+              // For now, if no successful outputs, and finalOutput isn't already an error, set a message.
+              if (!finalOutput || (typeof finalOutput === 'object' && !('error' in finalOutput))) {
+                  finalOutput = "No successful task outputs available for a final summary.";
+              }
           }
         } else if (crew.config.verbose) {
             console.log('\n[Crew AI] Hierarchical process completed, but no manager LLM available for final summary.');
@@ -621,7 +707,7 @@ ${finalOutput}
     crew.tasksOutput = taskOutputs;
     crew.status = 'COMPLETED';
     sendTelemetry('crew_ended', { crew_id: crew.id, status: 'COMPLETED' });
-  } catch (error) {
+  } catch (error: unknown) {
     crew.status = 'FAILED';
     const errorMessage = error instanceof Error ? error.message : String(error);
     crew.output = { error: errorMessage };
