@@ -10,6 +10,7 @@ import {
   createOpenAIChatClient,
   type ChatMessage,
 } from '../llms'; // Import necessary LLM types and factory
+import { performAgentTask } from '../agents';
 
 // biome-ignore lint/suspicious/noExplicitAny: <explanation>
 type Output = any; // Placeholder
@@ -19,14 +20,15 @@ export interface CrewConfig {
   tasks: Task[];
   process?: CrewProcess;
   verbose?: boolean | number;
-  managerLlm?: ChatLLM | OpenAIConfig; // Allow instantiated or config for manager
+  managerLlm?: ChatLLM | OpenAIConfig | Agent; // Allow Agent as manager
   shareCrew?: boolean;
 }
 
 export interface Crew {
   id: string;
   config: CrewConfig; // Holds the original config
-  managerLlmInstance?: ChatLLM; // Instantiated manager LLM for hierarchical
+  managerLlmInstance?: ChatLLM; // Instantiated manager LLM (if not an Agent)
+  managerAgentInstance?: Agent; // Instantiated manager Agent
   status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED';
   // biome-ignore lint/suspicious/noExplicitAny: <explanation>
   output: any;
@@ -71,31 +73,71 @@ export function createCrew(config: CrewConfig): Crew {
   }
 
   let instantiatedManagerLlm: ChatLLM | undefined;
+  let instantiatedManagerAgent: Agent | undefined;
 
   if (crewProcess === CrewProcess.HIERARCHICAL) {
     if (!config.managerLlm) {
       throw new Error(
-        'Crew creation failed: Hierarchical process requires a managerLlm to be configured.',
+        'Crew creation failed: Hierarchical process requires a managerLlm or manager Agent to be configured.',
       );
     }
-    if ('apiKey' in config.managerLlm && 'modelName' in config.managerLlm && !('chat' in config.managerLlm)) {
-      // It looks like an OpenAIConfig, try to instantiate it.
-      // This check can be expanded for other LLM config types in the future.
-      try {
-        instantiatedManagerLlm = createOpenAIChatClient(config.managerLlm as OpenAIConfig);
-      } catch (e) {
-        throw new Error(`Failed to create manager LLM for hierarchical crew: ${e instanceof Error ? e.message : String(e)}`);
+
+    const managerInput = config.managerLlm;
+
+    // Check 1: Is it an Agent instance (conforming to our Agent interface)?
+    if (
+      managerInput &&
+      typeof (managerInput as Agent).id === 'string' &&
+      typeof (managerInput as Agent).config === 'object' && // Holds role, goal, backstory, llm config etc.
+      typeof (managerInput as Agent).llm === 'object' && // Instantiated LLM for the agent
+      Array.isArray((managerInput as Agent).tools)
+      // We don't check for executeTask, interpolateInput, etc. on the Agent instance itself
+      // as these are standalone functions in our functional approach.
+    ) {
+      instantiatedManagerAgent = managerInput as Agent;
+      // The managerAgentInstance itself will be used. Its internal LLM is what matters.
+      if (!instantiatedManagerAgent.llm) { // Double check, though covered by the type guard essentially
+        console.warn(`Warning: Manager Agent "${instantiatedManagerAgent.config.role}" (ID: ${instantiatedManagerAgent.id}) does not have an LLM instantiated. This should not happen if type guards are correct.`);
       }
-    } else if (config.managerLlm && ('chat' in config.managerLlm || 'invoke' in config.managerLlm)) {
-      // It's already an instantiated LLM object that conforms to ChatLLM or LLM
-      instantiatedManagerLlm = config.managerLlm as ChatLLM;
-    } else {
-       throw new Error(
-        'Crew creation failed: managerLlm for hierarchical process is not a recognized LLM instance or known config type (e.g., OpenAIConfig).',
+    } 
+    // Check 2: Is it an already instantiated ChatLLM instance (but not an Agent)?
+    else if (
+      managerInput &&
+      (typeof (managerInput as ChatLLM).chat === 'function' || typeof (managerInput as ChatLLM).invoke === 'function') &&
+      // Ensure it's not also identifiable as our Agent interface (e.g. lacks a .config.role or .tools array)
+      !(typeof (managerInput as Agent).config?.role === 'string' && Array.isArray((managerInput as Agent).tools))
+    ) {
+      instantiatedManagerLlm = managerInput as ChatLLM;
+    } 
+    // Check 3: Is it an OpenAIConfig that needs instantiation?
+    else if (
+      managerInput &&
+      typeof (managerInput as OpenAIConfig).apiKey === 'string' &&
+      typeof (managerInput as OpenAIConfig).modelName === 'string' &&
+      !(typeof (managerInput as ChatLLM).chat === 'function') && 
+      !(typeof (managerInput as Agent).config?.role === 'string' && Array.isArray((managerInput as Agent).tools))
+    ) {
+      try {
+        instantiatedManagerLlm = createOpenAIChatClient(managerInput as OpenAIConfig);
+      } catch (e) {
+        throw new Error(`Failed to create manager LLM from OpenAIConfig for hierarchical crew: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } 
+    else {
+      let inputType = 'unknown type';
+      if (managerInput && typeof managerInput === 'object') {
+        // Convert managerInput to object to access Object.keys without TS complaining for union types
+        const managerInputAsObject = managerInput as object;
+        inputType = `${Object.keys(managerInputAsObject).slice(0, 3).join(', ')}...`; // Peek at some keys
+      }
+      throw new Error(
+        `Crew creation failed: managerLlm for hierarchical process is not a recognized Agent instance, LLM instance, or known LLM config type (e.g., OpenAIConfig). Provided input (first 3 keys): ${inputType}`,
       );
     }
-    if (!instantiatedManagerLlm) { // Should be caught by earlier checks, but as a safeguard
-        throw new Error('Manager LLM could not be instantiated for hierarchical process.');
+
+    if (!instantiatedManagerAgent && !instantiatedManagerLlm) {
+      // This should be caught by the else block above, but as a safeguard.
+      throw new Error('Manager could not be resolved for hierarchical process. Provide an Agent, an LLM instance, or an LLMConfig.');
     }
   }
 
@@ -103,6 +145,7 @@ export function createCrew(config: CrewConfig): Crew {
     id: uuidv4(),
     config, // Store the original config
     managerLlmInstance: instantiatedManagerLlm,
+    managerAgentInstance: instantiatedManagerAgent,
     status: 'PENDING',
     output: null,
     tasksOutput: new Map(),
@@ -197,7 +240,7 @@ ${crew.config.tasks.map((task) => `  - ${task.config.description} (ID: ${task.id
         }
       }
     } else if (currentProcess === CrewProcess.HIERARCHICAL) {
-      if (!crew.managerLlmInstance) {
+      if (!crew.managerLlmInstance && !crew.managerAgentInstance) {
         // This should ideally be caught by createCrew, but as a safeguard during run.
         throw new Error('Hierarchical process selected, but manager LLM is not available on the crew.');
       }
@@ -208,7 +251,6 @@ ${crew.config.tasks.map((task) => `  - ${task.config.description} (ID: ${task.id
       // --- HIERARCHICAL LOGIC --- 
       // This will be complex and iterative.
       // For now, a very simplified placeholder.
-      const managerLlm = crew.managerLlmInstance;
       let iterationCount = 0;
       const maxIterations = crew.config.tasks.length + 10; // Allow more iterations, e.g., for retries
 
@@ -269,9 +311,68 @@ Tasks not yet completed: ${currentRemainingTasks.length}
             }).filter(Boolean).join('\n');
 
         const managerPrompt = `
+As the project manager, your primary goal is to orchestrate the successful completion of all assigned tasks by effectively delegating to your team of agents and utilizing your available tools if necessary. 
+Review the current project status including available agents, their capabilities, remaining tasks (and their statuses), and any outputs or failures from previously attempted tasks. 
+Then, decide the next single action. 
+
+Actions:
+1. Delegate a task: If a task is ready for an agent, provide the delegation details in the specified JSON format.
+2. Use a tool: If you need more information or need to process existing information before delegating, you can use one of your tools. Ensure you provide your thought process and the required JSON for the tool call.
+3. Complete the project: If all tasks are completed, or you assess the project goals are met, respond with only the string "ALL_TASKS_COMPLETED".
+
+Follow the output format instructions precisely for delegation or tool use. For delegation, the JSON should be the ONLY content in your response if no tool is used.
+`;
+
+        let managerDecisionText: string;
+
+        if (crew.managerAgentInstance) {
+          // Manager is an Agent, use performAgentTask
+          if (crew.config.verbose) {
+            console.log(`Manager Agent "${crew.managerAgentInstance.config.role}" (ID: ${crew.managerAgentInstance.id}) is making a decision...`);
+            // We don't log the full prompt here as performAgentTask will construct its own.
+            // However, the core content (agents, tasks, summary) is similar to managerPrompt.
+            // The managerAgentInstance will get a task like "Decide next step for the crew given the following project status..."
+            // For now, we will pass the constructed managerPrompt as the task description for the manager agent.
+          }
+          // TODO: Refine how context (agentsDescription, tasksDescription, etc.) is passed to performAgentTask
+          // For now, the managerPrompt IS the task for the agent.
+          // performAgentTask itself prepends role, goal, backstory, tools. So the prompt here should be the core task.
+          const managerAgentTaskDescription = managerPrompt; // Simplified for now.
+          const managerContext = `
+Available Worker Agents (excluding yourself):
+${agentsDescription}
+
+Tasks to be Actioned (pending or failed and needing retry):
+${availableTasksDescription}
+
+${recentlyFailedTasksFeedback ? `Context on Recently Failed Tasks (from last iteration):
+${recentlyFailedTasksFeedback}` : ''}
+
+Completed Tasks Summary:
+${completedTasksSummary}
+
+Your available tools are: [${crew.managerAgentInstance?.tools.map(t => t.name).join(', ') || 'None'}]. Refer to their descriptions if you consider using them.
+
+Output format for delegation (JSON ONLY):
+{
+  "taskIdToDelegate": "<id_of_the_task_to_delegate>",
+  "agentIdToAssign": "<id_of_the_agent_to_assign_the_task>",
+  "additionalContextForAgent": "<any_specific_instructions_or_context>"
+}
+Output format for ALL_TASKS_COMPLETED: Respond with the exact string "ALL_TASKS_COMPLETED".
+`;
+
+          // The managerPrompt used for raw LLM is too specific in its JSON structure for an agent that might use tools first.
+          // performAgentTask will combine agent's system prompt, this task, context, and tool descriptions.
+          managerDecisionText = await performAgentTask(crew.managerAgentInstance, managerAgentTaskDescription, managerContext);
+
+        } else if (crew.managerLlmInstance) {
+          // Manager is a raw LLM, use direct chat
+          // Construct the specific prompt for raw LLM decision making (expects JSON or completion string)
+          const rawManagerPrompt = `
 As the project manager, your goal is to successfully complete all assigned tasks by orchestrating a team of agents.
 
-Available Agents:
+Available Agents (excluding yourself, the manager):
 ${agentsDescription}
 
 Tasks to be Actioned (either pending or previously failed and needing retry):
@@ -284,10 +385,9 @@ You should consider these failures when delegating.` : ''}
 Completed Tasks Summary:
 ${completedTasksSummary}
 
-Based on the available tasks, agent capabilities, and any recent failures, decide the next single task to delegate and to which agent.
-Consider if a previously failed task should be retried (perhaps with a different agent or modified context if you provide one).
+Based on the available tasks, agent capabilities, and any recent failures, decide the next single task to delegate and to which agent. 
 If all tasks are completed, or you believe the goal is met based on the completed tasks, respond with "ALL_TASKS_COMPLETED".
-Otherwise, respond in the following JSON format ONLY:
+Otherwise, respond in the following JSON format ONLY (ensuring valid JSON, especially with escaped characters in strings if needed):
 {
   "taskIdToDelegate": "<id_of_the_task_to_delegate_from_the_Tasks_to_be_Actioned_list>",
   "agentIdToAssign": "<id_of_the_agent_to_assign_the_task>",
@@ -295,16 +395,19 @@ Otherwise, respond in the following JSON format ONLY:
 }
 Ensure the IDs are exact from the lists provided.
 `;
-
-        if (crew.config.verbose) {
-          console.log(`Manager LLM Prompt:
-${managerPrompt.substring(0, 500)}...
+          if (crew.config.verbose) {
+            console.log(`Manager LLM (${crew.managerLlmInstance.providerName} - ${crew.managerLlmInstance.id}) is making a decision...`);
+            console.log(`Manager LLM Prompt (Raw):
+${rawManagerPrompt.substring(0, 1000)}...
 `);
+          }
+          const managerMessages: ChatMessage[] = [{ role: 'user', content: rawManagerPrompt }];
+          const managerResponse = await crew.managerLlmInstance.chat(managerMessages);
+          managerDecisionText = managerResponse.content;
+        } else {
+          // Should be caught by createCrew, but as a safeguard.
+          throw new Error('Hierarchical process: No manager (Agent or LLM) available.');
         }
-
-        const managerMessages: ChatMessage[] = [{ role: 'user', content: managerPrompt }];
-        const managerResponse = await managerLlm.chat(managerMessages);
-        const managerDecisionText = managerResponse.content;
 
         if (crew.config.verbose) {
           console.log(`Manager LLM Response:
@@ -406,21 +509,27 @@ ${managerDecisionText}
       }
       
       // --- START: Phase 2: Manager's Final Summary/Output (Feature B) ---
-      if (allTasksCompleted && taskOutputs.size > 0 && managerLlm) {
-        if (crew.config.verbose) {
-          console.log('\n[Crew AI] All tasks completed. Requesting final summary from manager LLM...');
-        }
-        const successfulTaskOutputsSummary = Array.from(taskOutputs.entries())
-          .filter(([, result]) => !(result.output && typeof result.output === 'object' && 'error' in result.output))
-          .map(([taskId, result]) => {
-            const task = crew.config.tasks.find(t => t.id === taskId);
-            return `Task: ${task?.config.description || taskId}
-Output: ${typeof result.output === 'string' ? result.output : JSON.stringify(result.output)}`;
-          })
-          .join('\n\n');
+      if (allTasksCompleted && taskOutputs.size > 0) {
+        let finalSummaryProviderAvailable = false;
+        if (crew.managerAgentInstance?.llm) finalSummaryProviderAvailable = true;
+        else if (crew.managerLlmInstance) finalSummaryProviderAvailable = true;
 
-        if (successfulTaskOutputsSummary) {
-          const finalSummaryPrompt = `
+        if (finalSummaryProviderAvailable) {
+          if (crew.config.verbose) {
+            const providerType = crew.managerAgentInstance ? `Agent (${crew.managerAgentInstance.config.role})` : `LLM (${crew.managerLlmInstance?.providerName})`;
+            console.log(`\n[Crew AI] All tasks completed. Requesting final summary from manager ${providerType}...`);
+          }
+          const successfulTaskOutputsSummary = Array.from(taskOutputs.entries())
+            .filter(([, result]) => !(result.output && typeof result.output === 'object' && 'error' in result.output))
+            .map(([taskId, result]) => {
+              const task = crew.config.tasks.find(t => t.id === taskId);
+              return `Task: ${task?.config.description || taskId}
+Output: ${typeof result.output === 'string' ? result.output : JSON.stringify(result.output)}`;
+            })
+            .join('\n\n');
+
+          if (successfulTaskOutputsSummary) {
+            const finalSummaryPrompt = `
 All assigned tasks have been completed. Based on the following task outputs, please provide a comprehensive final summary or answer that fulfills the overall crew objective.
 
 Summary of Successfully Completed Task Outputs:
@@ -429,42 +538,57 @@ ${successfulTaskOutputsSummary}
 Crew Objective (inferred from tasks): [Consider dynamically generating a crew objective summary if not explicitly provided in CrewConfig later]
 Based on the provided outputs, synthesize the final result.
 `;
-          try {
-            const summaryMessages: ChatMessage[] = [{ role: 'user', content: finalSummaryPrompt }];
-            if (crew.config.verbose) {
-                console.log(`Manager LLM Final Summary Prompt:
+            try {
+              const summaryMessages: ChatMessage[] = [{ role: 'user', content: finalSummaryPrompt }];
+              if (crew.config.verbose) {
+                  console.log(`Manager Final Summary Prompt:
 ${finalSummaryPrompt.substring(0,500)}...
 `);
-            }
-            const summaryResponse = await managerLlm.chat(summaryMessages);
-            finalOutput = summaryResponse.content; // Manager's summarized output
-            if (crew.config.verbose) {
-                console.log(`Manager LLM Final Summary Response:
+              }
+              // Use manager agent's LLM if available and it supports chat, otherwise the direct manager LLM instance
+              let summaryMade = false;
+              if (crew.managerAgentInstance?.llm && typeof (crew.managerAgentInstance.llm as ChatLLM).chat === 'function') {
+                  const summaryResponse = await (crew.managerAgentInstance.llm as ChatLLM).chat(summaryMessages);
+                  finalOutput = summaryResponse.content;
+                  summaryMade = true;
+              } else if (crew.managerLlmInstance) { 
+                  const summaryResponse = await crew.managerLlmInstance.chat(summaryMessages);
+                  finalOutput = summaryResponse.content; // Manager's summarized output
+                  summaryMade = true;
+              } else {
+                  // This case means no suitable LLM was found for summarization.
+                  console.warn('[Crew AI] No manager LLM with chat capabilities available for final summary, though tasks were completed.');
+              }
+
+              if (summaryMade && crew.config.verbose && finalOutput) { 
+                  console.log(`Manager Final Summary Response:
 ${finalOutput}
 `);
+              }
+
+              // if finalOutput is null or only contains a warning, set a completion message.
+              if (!summaryMade && (!finalOutput || (typeof finalOutput === 'object' && 'warning' in finalOutput && Object.keys(finalOutput).length === 1))) {
+                   finalOutput = "All tasks processed. No summary could be generated due to lack of suitable manager LLM or no successful outputs.";
+              }
+            } catch (e) {
+              console.error('Failed to get final summary from manager:', e);
+              // finalOutput would remain as the output of the last task, or the warning if max iterations hit.
+              // Add this error to the crew's output.
+               const existingError = (finalOutput && typeof finalOutput === 'object' && finalOutput.error) ? `${finalOutput.error}; ` : '';
+               finalOutput = { 
+                  ...(typeof finalOutput === 'object' ? finalOutput : { previousOutput: finalOutput }),
+                  error: `${existingError}Failed to get final summary from manager: ${e instanceof Error ? e.message : String(e)}`
+               };
             }
-          } catch (e) {
-            console.error('Failed to get final summary from manager LLM:', e);
-            // finalOutput would remain as the output of the last task, or the warning if max iterations hit.
-            // Add this error to the crew's output.
-             const existingError = (finalOutput && typeof finalOutput === 'object' && finalOutput.error) ? `${finalOutput.error}; ` : '';
-             finalOutput = { 
-                ...(typeof finalOutput === 'object' ? finalOutput : { previousOutput: finalOutput }),
-                error: `${existingError}Failed to get final summary from manager: ${e instanceof Error ? e.message : String(e)}`
-             };
+          } else {
+              console.log('\n[Crew AI] Hierarchical process completed, but no manager LLM available for final summary.');
           }
-        } else {
-            if (crew.config.verbose) {
-                console.log('No successful task outputs to summarize by manager.');
-            }
-            // if finalOutput is null or only contains a warning, set a completion message.
-            if (!finalOutput || (typeof finalOutput === 'object' && 'warning' in finalOutput && Object.keys(finalOutput).length === 1)) {
-                 finalOutput = "All tasks processed, but no specific outputs were generated or all failed.";
-            }
+        } else if (crew.config.verbose) {
+            console.log('\n[Crew AI] Hierarchical process completed, but no manager LLM available for final summary.');
         }
-      } else if (crew.config.verbose && managerLlm && taskOutputs.size === 0) {
+      } else if (crew.config.verbose && taskOutputs.size === 0 && (crew.managerLlmInstance || crew.managerAgentInstance)) {
           console.log('\n[Crew AI] Hierarchical process finished, but no task outputs were recorded to summarize.');
-      } else if (crew.config.verbose && managerLlm && !allTasksCompleted) {
+      } else if (crew.config.verbose && !allTasksCompleted && (crew.managerLlmInstance || crew.managerAgentInstance)) {
           console.log('\n[Crew AI] Hierarchical process finished, but not all tasks were completed. Skipping manager summary.');
       }
       // --- END: Phase 2 ---

@@ -7,6 +7,8 @@ import { createAgent } from '../agents'; // Assuming factory function
 import type { Task, TaskConfig } from '../tasks';
 import { createTask, executeTask as originalExecuteTask } from '../tasks'; // Assuming factory and executeTask
 import type { ChatLLM, OpenAIConfig } from '../llms'; // Import ChatLLM
+import { performAgentTask as originalPerformAgentTask } from '../agents';
+import type { Tool, ToolContext } from '../tools'; // Added ToolContext
 
 // Mock the executeTask function from src/tasks
 vi.mock('../tasks', async (importOriginal) => {
@@ -28,6 +30,16 @@ vi.mock('../tasks', async (importOriginal) => {
 // After vi.mock, executeTask is now the mocked version
 const mockedExecuteTask = originalExecuteTask as MockedFunction<typeof originalExecuteTask>;
 
+// Mock performAgentTask
+vi.mock('../agents', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../agents')>();
+  return {
+    ...original,
+    performAgentTask: vi.fn(), // Default mock
+  };
+});
+const mockedPerformAgentTask = originalPerformAgentTask as MockedFunction<typeof originalPerformAgentTask>;
+
 // Mock the sendTelemetry function (if it were exported and you wanted to spy on it)
 // For now, it's an internal function, so we test its effects via console logs if verbose or by assuming it's called.
 
@@ -41,6 +53,7 @@ describe('Crew', () => {
   beforeEach(() => {
     vi.clearAllMocks(); // Clear mocks before each test
     mockedExecuteTask.mockClear(); // Clear the specific mock
+    mockedPerformAgentTask.mockClear();
 
     // Create mock agents using the factory
     const agentConfig1: AgentConfig = {
@@ -80,7 +93,7 @@ describe('Crew', () => {
     };
 
     // Spy on console methods if verbose mode is tested
-    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {}); // Re-enable the spy
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
@@ -359,6 +372,190 @@ describe('Crew', () => {
       };
       // This scenario is caught by createCrew
        expect(() => createCrew(crewConfig)).toThrow('Crew creation failed: No agents provided.');
+    });
+
+    describe('Hierarchical Process with Manager Agent using Tools', () => {
+      let managerAgent: Agent;
+      let workerAgent: Agent;
+      let taskToDelegate: Task;
+      let managerDecisionHelperTool: Tool<unknown, unknown>;
+      let mockManagerAgentLlm: MockedFunction<ChatLLM['chat']>;
+
+      beforeEach(() => {
+        // Setup specific to this describe block
+        managerDecisionHelperTool = {
+          name: 'managerDecisionHelperTool',
+          description: 'A tool to help manager make decisions.',
+          execute: vi.fn().mockImplementation(async (input: unknown, _context?: ToolContext) => {
+            // More lenient mock for now to check if it's called at all
+            // console.log('Mock tool execute called with input:', input, 'context:', _context); // For debugging during test runs
+            return Promise.resolve(`Tool output: crucial data gathered, input type: ${typeof input}`);
+          }),
+        };
+
+        mockManagerAgentLlm = vi.fn();
+        const managerLlmInstance: ChatLLM = {
+          id: 'manager-agent-llm',
+          providerName: 'openai',
+          config: { modelName: 'gpt-4-test' } as OpenAIConfig,
+          chat: mockManagerAgentLlm,
+          invoke: vi.fn(),
+        };
+
+        const managerAgentConfig: AgentConfig = {
+          role: 'Chief Decision Maker',
+          goal: 'Delegate tasks efficiently after analysis',
+          backstory: 'Has access to analytical tools.',
+          llm: managerLlmInstance,
+          tools: [managerDecisionHelperTool],
+          verbose: true, // Enable verbose for manager agent for potential logging
+        };
+        managerAgent = createAgent(managerAgentConfig);
+
+        const workerAgentConfig: AgentConfig = {
+          role: 'Worker Bee',
+          goal: 'Execute assigned tasks',
+          backstory: 'Diligent worker.',
+          // llm: {} as any, // Assuming worker agent might not need LLM for some tasks or it's mocked differently
+        };
+        workerAgent = createAgent(workerAgentConfig);
+
+        taskToDelegate = createTask({
+          description: 'Important task to be delegated',
+          expectedOutput: 'Result of the important task',
+          // No agent assigned initially, manager will assign it
+        });
+        
+        // Reset the global mockedPerformAgentTask for other tests if necessary
+        // For this suite, we are testing the crew's invocation of performAgentTask on the manager agent
+        // and that performAgentTask correctly uses the manager's LLM and tools.
+        // So we let the *actual* performAgentTask run for the managerAgent.
+        // We mock the managerAgent's LLM (chat method).
+        mockedPerformAgentTask.mockImplementation(async (agent: Agent, taskDescription: string, context?: string) => {
+          // This is a fallback mock for performAgentTask if it's called for agents OTHER than the manager
+          // or if the manager agent scenario needs a specific controlled outcome not tied to its internal LLM directly.
+          // For the manager agent, its own LLM (mockManagerAgentLlm) will be invoked by the *actual* performAgentTask.
+          if (agent.id === managerAgent.id) {
+            // highlight-start
+            // console.log(`DEBUG: mockedPerformAgentTask: MANAGER AGENT (${agent.id}) DETECTED. Calling original.`);
+            // highlight-end
+            // Let the actual performAgentTask run for the manager agent
+            // by calling the original implementation. This is tricky with vi.mock.
+            // The alternative is to NOT mock performAgentTask globally, and only spy on it,
+            // or to re-implement its logic here for the manager if needed.
+            // Given the user's note, we want performAgentTask to do its job.
+            // The global mock of performAgentTask might interfere.
+
+            // To test the manager agent truly using its tools via the *actual* performAgentTask,
+            // performAgentTask should NOT be mocked for the managerAgent.
+            // Let's adjust the global mock to allow passthrough or specific handling.
+            const originalAgentsModule = await vi.importActual<typeof import('../agents')>('../agents');
+            // highlight-start
+            const result = await originalAgentsModule.performAgentTask(agent, taskDescription, context);
+            // console.log(`DEBUG: mockedPerformAgentTask: MANAGER AGENT original call returned snippet: ${result.substring(0, 200)}`);
+            return result;
+            // highlight-end
+
+          }
+          // highlight-start
+          // console.log(`DEBUG: mockedPerformAgentTask: DEFAULT MOCK for agent ${agent.id} (${agent.config.role})`);
+          // highlight-end
+          // Default mock behavior for other agents (e.g. worker agents if their tasks were complex)
+          return `Default mock output for ${agent.config.role} performing: ${taskDescription}`;
+        });
+      });
+
+      it('should allow manager agent to use its tool before delegating a task and complete the crew', async () => {
+        const crewConfig: CrewConfig = {
+          agents: [managerAgent, workerAgent], // Manager agent must be in the list
+          tasks: [taskToDelegate],
+          process: CrewProcess.HIERARCHICAL,
+          managerLlm: managerAgent, // Manager is an Agent instance
+          verbose: true,
+        };
+        const crew = createCrew(crewConfig);
+
+        // 1. Manager agent's LLM is first asked for a decision (by performAgentTask, called by runCrew)
+        // It decides to use its tool.
+        const toolCallCommand = `Okay, I need to use my tool. Here is the tool call: \`\`\`json
+{
+  "tool_name": "managerDecisionHelperTool",
+  "tool_input": "analyze current tasks"
+}
+\`\`\``;
+        mockManagerAgentLlm.mockResolvedValueOnce({ role: 'assistant', content: toolCallCommand });
+
+        // 2. After tool execution, manager agent's LLM is called again (by performAgentTask)
+        // It now provides the delegation.
+        const delegationDecision = `Great, the tool output was very helpful. Now I will delegate. \`\`\`json
+{
+  "taskIdToDelegate": "${taskToDelegate.id}",
+  "agentIdToAssign": "${workerAgent.id}",
+  "additionalContextForAgent": "Tool insights: crucial data gathered. Focus on this."
+}
+\`\`\``;
+        mockManagerAgentLlm.mockResolvedValueOnce({ role: 'assistant', content: delegationDecision });
+        
+        // 3. Manager LLM is called for the final summary
+        mockManagerAgentLlm.mockResolvedValueOnce({ role: 'assistant', content: 'All tasks completed. Final summary by manager based on results.' });
+
+
+        await runCrew(crew);
+
+        // Assertions
+        // Verify manager's tool was called
+        expect(managerDecisionHelperTool.execute).toHaveBeenCalledTimes(1);
+        expect(managerDecisionHelperTool.execute).toHaveBeenCalledWith(
+          'analyze current tasks',
+          {
+            taskDescription: expect.stringContaining('As the project manager'), // The manager task description
+            originalTaskContext: expect.stringContaining('Tasks to be Actioned'), // The manager context
+          },
+        );
+
+        // Check for verbose logging related to tool use by manager agent
+        // The spy is on console.log directly from the global beforeEach
+        // highlight-start
+        expect(console.log).toHaveBeenCalledWith(
+          expect.stringContaining(`Agent ${managerAgent.config.role} attempting to use tool: ${managerDecisionHelperTool.name}`),
+        );
+        expect(console.log).toHaveBeenCalledWith(
+          expect.stringContaining(`Agent ${managerAgent.config.role} tool ${managerDecisionHelperTool.name} output:`),
+        );
+        // highlight-end
+
+        // Verify the task was delegated and executed
+        expect(mockedExecuteTask).toHaveBeenCalledTimes(1);
+        expect(mockedExecuteTask).toHaveBeenCalledWith(
+          expect.objectContaining({ id: taskToDelegate.id }),
+          expect.objectContaining({ id: workerAgent.id }),
+          // expect.anything() // TODO: Refine to check context propagation
+        );
+        
+        const executeTaskCall = mockedExecuteTask.mock.calls[0];
+        const taskArg = executeTaskCall[0] as Task;
+        expect(taskArg.config.context).toContain("Tool insights: crucial data gathered. Focus on this.");
+
+
+        expect(taskToDelegate.status).toBe('completed');
+        expect(taskToDelegate.output).toBe(`Output from task: ${taskToDelegate.config.description}`); // From global mock
+
+        // Verify crew completion
+        expect(crew.status).toBe('COMPLETED');
+        expect(crew.output).toBe('All tasks completed. Final summary by manager based on results.');
+        
+        // Verify manager's LLM was called for decision and summary
+        expect(mockManagerAgentLlm).toHaveBeenCalledTimes(3); // 1 for tool use, 1 for delegation, 1 for final summary
+
+        // Check verbose logging (optional, but good to confirm)
+        // highlight-start
+        // The following logs were for a previous logging style and are no longer generated directly by runCrew for manager tool use.
+        // Tool usage logs are now primarily handled within performAgentTask and checked by earlier assertions.
+        // expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`[Crew AI - ${crew.id}] [Manager Agent - ${managerAgent.config.role}] Using tool: ${managerDecisionHelperTool.name}`));
+        // expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`[Crew AI - ${crew.id}] [Manager Agent - ${managerAgent.config.role}] Tool managerDecisionHelperTool output: Tool output: crucial data gathered`));
+        // expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`[Crew AI - ${crew.id}] Delegating task "${taskToDelegate.config.description}" to agent "${workerAgent.config.role}"`));
+        // highlight-end
+      });
     });
   });
 }); 
