@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+echo "Running pre-push hook: Linting and Testing..."
+
+pnpm lint || {
+  echo "Linting failed. Aborting push."
+  exit 1
+}
+
+pnpm test || {
+  echo "Tests failed. Aborting push."
+  exit 1
+}
+
+echo "Linting and tests passed. Proceeding with push."
+exit 0 
